@@ -1,0 +1,90 @@
+services:
+  hermes:
+    image: nousresearch/hermes-agent:${HERMES_IMAGE_TAG:-latest}
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+
+    # Toàn bộ state (config, .env, sessions, memories, skills, logs) nằm ở /opt/data.
+    # Image là stateless — nâng cấp không mất gì.
+    volumes:
+      - ${HERMES_DATA_DIR:-~/.hermes}:/opt/data
+
+    ports:
+      # Mặc định bind vào loopback của host. Vào dashboard qua SSH tunnel:
+      #   ssh -L 9119:127.0.0.1:9119 user@host
+      # Muốn phơi ra LAN/internet: đổi HERMES_BIND_ADDR=0.0.0.0 trong .env
+      # VÀ đọc kỹ phần auth ở README trước.
+      - "${HERMES_BIND_ADDR:-127.0.0.1}:${HERMES_API_PORT:-8642}:8642"    # OpenAI-compatible API + health
+      - "${HERMES_BIND_ADDR:-127.0.0.1}:${HERMES_DASHBOARD_PORT:-9119}:9119"  # web dashboard
+
+    environment:
+      # --- Dashboard ---------------------------------------------------------
+      - HERMES_DASHBOARD=1
+      # Trong container dashboard bind 0.0.0.0 (mặc định) để port publish tới được.
+      # Vì bind non-loopback => auth gate BẮT BUỘC có provider, nếu không container
+      # fail closed lúc startup. Provider đơn giản nhất là username/password:
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:?dat HERMES_DASHBOARD_USER trong .env}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?dat HERMES_DASHBOARD_PASSWORD trong .env}
+      # Giữ session đăng nhập ổn định qua restart container:
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${HERMES_DASHBOARD_SECRET:?dat HERMES_DASHBOARD_SECRET trong .env}
+
+      # --- Quyền file trên volume -------------------------------------------
+      # Runtime chạy UID 10000. Nếu thư mục data trên host thuộc user khác
+      # (rất hay gặp trên NAS / bind mount), set về UID/GID của chủ thư mục đó.
+      - PUID=${HERMES_PUID:-10000}
+      - PGID=${HERMES_PGID:-10000}
+
+      # --- API server (tùy chọn) --------------------------------------------
+      # Chỉ bật khi cần client OpenAI-compatible (Open WebUI, LobeChat...) hoặc
+      # tool ngoài gọi vào. Bỏ comment cả 3 dòng cùng lúc.
+      # - API_SERVER_ENABLED=true
+      # - API_SERVER_HOST=0.0.0.0
+      # - API_SERVER_KEY=${HERMES_API_KEY:?openssl rand -hex 32}
+
+      # --- Model / platform keys --------------------------------------------
+      # KHÔNG khai ở đây. Chúng thuộc về ~/.hermes/.env (do `hermes setup` ghi),
+      # nằm trên volume nên sống sót qua mọi lần recreate container.
+      # Chỉ forward qua đây khi lấy từ secrets-manager và không muốn ghi ra đĩa:
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+
+    # Playwright/Chromium cần shared memory, thiếu là browser tools chết lặng.
+    shm_size: "1gb"
+
+    # s6 cần thời gian tắt sạch các gateway theo profile.
+    stop_grace_period: 30s
+
+    # docker logs không tự xoay vòng; gateway tee stdout vào đây nên sẽ phình.
+    # (Bản rotated bền vẫn nằm ở ~/.hermes/logs/gateways/<profile>/current)
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    deploy:
+      resources:
+        limits:
+          memory: ${HERMES_MEMORY_LIMIT:-4G}
+          cpus: "${HERMES_CPU_LIMIT:-2.0}"
+
+    # Healthcheck: chỉ bật MỘT trong hai, tùy cấu hình.
+    #
+    # (a) Hỏi thẳng supervisor s6 — chạy được kể cả khi API server tắt:
+    # healthcheck:
+    #   test: ["CMD", "/command/s6-svstat", "-u", "/run/service/gateway-default"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 60s
+    #
+    # (b) Gọi health endpoint — CHỈ dùng khi đã bật API_SERVER_ENABLED=true,
+    #     không thì container bị đánh dấu unhealthy vĩnh viễn:
+    # healthcheck:
+    #   test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8642/health"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 60s

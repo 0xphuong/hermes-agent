@@ -1,0 +1,14 @@
+# Secrets — KHONG BAO GIO commit
+.env
+*.env
+!.env.example
+
+# Override cuc bo cua tung may
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+# Neu ai do lo dat thu muc du lieu ngay trong repo
+.hermes/
+data/
+
+.DS_Store
