@@ -7,6 +7,9 @@
 docker-compose.override.yml
 docker-compose.*.local.yml
 
+# Cai dat cuc bo cua Claude Code
+.claude/settings.local.json
+
 # Neu ai do lo dat thu muc du lieu ngay trong repo
 .hermes/
 data/

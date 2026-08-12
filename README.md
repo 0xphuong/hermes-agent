@@ -8,7 +8,38 @@ không mất gì.
 
 ---
 
-## Cài lần đầu
+## Cài nhanh
+
+```bash
+git clone git@github-0xphuong:0xphuong/hermes-agent.git
+cd hermes-agent
+./setup.sh
+```
+
+Script tạo thư mục dữ liệu, chạy setup wizard của hermes, `docker compose up -d`, rồi in ra URL
+và thông tin truy cập. Chạy lại nhiều lần được — giá trị đã có không bị ghi đè.
+
+**Secret nội bộ** (`HERMES_DASHBOARD_SECRET`, `JWT_SECRET`, `API_KEY_SECRET`, `MACHINE_ID_SALT`)
+sinh tự động, không hỏi.
+
+**Mật khẩu đăng nhập** — dashboard và 9router — script hỏi bạn nhập (gõ 2 lần, không hiện ký tự).
+Nhấn Enter để bỏ qua và dùng chuỗi ngẫu nhiên.
+
+> Mật khẩu không được chứa `$`. Docker compose hiểu đó là biến và nuốt phần sau — `ab$cde` vào
+> container chỉ còn `ab`, không báo lỗi gì. Script chặn ngay lúc nhập.
+
+| Tuỳ chọn | Tác dụng |
+|---|---|
+| `--with-claude-code` | Build image từ `Dockerfile` (có sẵn CLI `claude`) thay vì dùng image chính thức |
+| `--no-start` | Chỉ tạo file config, không khởi động |
+| `--non-interactive` | Không hỏi gì, sinh ngẫu nhiên cả mật khẩu đăng nhập (dùng cho CI) |
+| `--help` | Xem hướng dẫn |
+
+Phần dưới mô tả các bước thủ công mà script làm thay.
+
+---
+
+## Cài lần đầu (thủ công)
 
 ### 1. Chuẩn bị
 

@@ -10,6 +10,9 @@ services:
     volumes:
       - ${HERMES_DATA_DIR:-~/.hermes}:/opt/data
 
+    networks:
+      - hermes-net
+
     ports:
       # Mặc định bind vào loopback của host. Vào dashboard qua SSH tunnel:
       #   ssh -L 9119:127.0.0.1:9119 user@host
@@ -28,6 +31,11 @@ services:
       - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?dat HERMES_DASHBOARD_PASSWORD trong .env}
       # Giữ session đăng nhập ổn định qua restart container:
       - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${HERMES_DASHBOARD_SECRET:?dat HERMES_DASHBOARD_SECRET trong .env}
+
+      # --- Claude Code -------------------------------------------------------
+      # Token OAuth cho CLI `claude` (sinh bang `claude setup-token`).
+      # De trong => phai login thu cong trong container.
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
 
       # --- Quyền file trên volume -------------------------------------------
       # Runtime chạy UID 10000. Nếu thư mục data trên host thuộc user khác
@@ -88,3 +96,65 @@ services:
     #   timeout: 5s
     #   retries: 3
     #   start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # 9router — LLM router. Hermes gọi tới bằng tên container: http://9router:20128
+  # ---------------------------------------------------------------------------
+  9router:
+    image: decolua/9router:latest
+    container_name: 9router
+    restart: unless-stopped
+
+    ports:
+      - "${HERMES_BIND_ADDR:-127.0.0.1}:${ROUTER_PORT:-20128}:20128"
+
+    volumes:
+      - ${ROUTER_DATA_DIR:-~/.9router}:/app/data
+
+    # File riêng, KHÔNG dùng .env chung — .env chứa credential của hermes
+    # (dashboard password, CLAUDE_CODE_OAUTH_TOKEN) và env_file nap tat ca vao container.
+    env_file:
+      - 9router.env
+
+    # Ghi de len gia tri trong 9router.env (compose uu tien environment hon env_file)
+    environment:
+      DATA_DIR: /app/data
+      PORT: "20128"
+      HOSTNAME: "0.0.0.0"
+      NODE_ENV: production
+      HEADROOM_URL: http://headroom:8787
+
+    depends_on:
+      - headroom
+
+    networks:
+      - hermes-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  headroom:
+    image: ghcr.io/chopratejas/headroom:latest
+    container_name: headroom
+    restart: unless-stopped
+
+    # 9router goi headroom qua network noi bo, khong can publish.
+    # Bo comment neu can truy cap truc tiep tu host de debug.
+    # ports:
+    #   - "${HERMES_BIND_ADDR:-127.0.0.1}:8787:8787"
+
+    networks:
+      - hermes-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  hermes-net:
+    driver: bridge
