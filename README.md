@@ -1,14 +1,14 @@
 # hermes-agent
 
-Docker Compose deployment cho [Hermes Agent](https://hub.docker.com/r/nousresearch/hermes-agent).
+Docker Compose deployment for [Hermes Agent](https://hub.docker.com/r/nousresearch/hermes-agent).
 
-Image là **stateless** — toàn bộ state (config, API keys, sessions, memories, skills, logs)
-nằm ở `/opt/data` trong container, mount từ `~/.hermes` trên host. Nâng cấp = pull image mới,
-không mất gì.
+The image is **stateless** — all state (config, API keys, sessions, memories, skills, logs) lives
+under `/opt/data` in the container, mounted from `~/.hermes` on the host. Upgrading means pulling a
+new image; nothing is lost.
 
 ---
 
-## Cài nhanh
+## Quick install
 
 ```bash
 git clone git@github-0xphuong:0xphuong/hermes-agent.git
@@ -16,32 +16,34 @@ cd hermes-agent
 ./setup.sh
 ```
 
-Script tạo thư mục dữ liệu, chạy setup wizard của hermes, `docker compose up -d`, rồi in ra URL
-và thông tin truy cập. Chạy lại nhiều lần được — giá trị đã có không bị ghi đè.
+The script creates the data directories, runs the hermes setup wizard, does `docker compose up -d`,
+then prints the URLs and access details. It is safe to re-run — existing values are never
+overwritten.
 
-**Secret nội bộ** (`HERMES_DASHBOARD_SECRET`, `JWT_SECRET`, `API_KEY_SECRET`, `MACHINE_ID_SALT`)
-sinh tự động, không hỏi.
+**Internal secrets** (`HERMES_DASHBOARD_SECRET`, `JWT_SECRET`, `API_KEY_SECRET`, `MACHINE_ID_SALT`)
+are generated automatically, with no prompt.
 
-**Mật khẩu đăng nhập** — dashboard và 9router — script hỏi bạn nhập (gõ 2 lần, không hiện ký tự).
-Nhấn Enter để bỏ qua và dùng chuỗi ngẫu nhiên.
+**Login passwords** — dashboard and 9router — are prompted for (typed twice, not echoed). Press
+Enter to skip and get a random string instead.
 
-> Mật khẩu không được chứa `$`. Docker compose hiểu đó là biến và nuốt phần sau — `ab$cde` vào
-> container chỉ còn `ab`, không báo lỗi gì. Script chặn ngay lúc nhập.
+> Passwords must not contain `$`. Docker Compose reads it as a variable and swallows the rest —
+> `ab$cde` arrives in the container as `ab`, with no error anywhere. The script rejects it at the
+> prompt.
 
-| Tuỳ chọn | Tác dụng |
+| Option | Effect |
 |---|---|
-| `--with-claude-code` | Build image từ `Dockerfile` (có sẵn CLI `claude`) thay vì dùng image chính thức |
-| `--no-start` | Chỉ tạo file config, không khởi động |
-| `--non-interactive` | Không hỏi gì, sinh ngẫu nhiên cả mật khẩu đăng nhập (dùng cho CI) |
-| `--help` | Xem hướng dẫn |
+| `--with-claude-code` | Build the image from `Dockerfile` (bundles the `claude` CLI) instead of using the official one |
+| `--no-start` | Only write the config files, do not start anything |
+| `--non-interactive` | Prompt for nothing, generate the login passwords too (for CI) |
+| `--help` | Show usage |
 
-Phần dưới mô tả các bước thủ công mà script làm thay.
+The rest of this document describes the manual steps the script performs for you.
 
 ---
 
-## Cài lần đầu (thủ công)
+## First install (manual)
 
-### 1. Chuẩn bị
+### 1. Prepare
 
 ```bash
 git clone git@github-0xphuong:0xphuong/hermes-agent.git
@@ -49,34 +51,34 @@ cd hermes-agent
 cp .env.example .env
 ```
 
-Sinh 2 secret và điền vào `.env`:
+Generate two secrets and fill them into `.env`:
 
 ```bash
 openssl rand -hex 32   # -> HERMES_DASHBOARD_PASSWORD
 openssl rand -hex 32   # -> HERMES_DASHBOARD_SECRET
 ```
 
-### 2. Chạy setup wizard
+### 2. Run the setup wizard
 
-Wizard hỏi API key của model và token các chat platform, ghi vào `~/.hermes/.env`.
-Chỉ cần làm **một lần**:
+The wizard asks for model API keys and chat-platform tokens, and writes them to `~/.hermes/.env`.
+It only needs to run **once**:
 
 ```bash
 mkdir -p ~/.hermes
 docker run -it --rm -v ~/.hermes:/opt/data nousresearch/hermes-agent setup
 ```
 
-> **Đừng dùng browser console của VPS** (Hetzner và nhiều nhà cung cấp khác) để gõ lệnh này.
-> Console web truyền sai ký tự đặc biệt — `:` thành `;`, `@` lỗi render — làm hỏng ngầm tham số
-> `-v ~/.hermes:/opt/data` và API key dán vào. Dùng SSH: `ssh root@<host>`.
+> **Do not run this from a VPS browser console** (Hetzner and many other providers). Web consoles
+> mistransmit special characters — `:` becomes `;`, `@` renders wrong — silently corrupting both the
+> `-v ~/.hermes:/opt/data` argument and any API key you paste. Use SSH: `ssh root@<host>`.
 
-Nếu dùng Nous Portal, chạy thêm (refresh token persist trong volume):
+If you use Nous Portal, also run (the refresh token persists in the volume):
 
 ```bash
 docker run -it --rm -v ~/.hermes:/opt/data nousresearch/hermes-agent setup --portal
 ```
 
-### 3. Khởi động
+### 3. Start
 
 ```bash
 docker compose up -d
@@ -85,68 +87,71 @@ docker compose logs -f
 
 ---
 
-## Truy cập
+## Access
 
-| Dịch vụ | Địa chỉ | Ghi chú |
+| Service | Address | Notes |
 |---|---|---|
-| Dashboard | `http://127.0.0.1:9119` | Đăng nhập bằng `HERMES_DASHBOARD_USER` / `_PASSWORD` |
-| API (OpenAI-compatible) | `http://127.0.0.1:8642` | Chỉ hoạt động khi bật `API_SERVER_*` |
+| Dashboard | `http://127.0.0.1:9119` | Log in with `HERMES_DASHBOARD_USER` / `_PASSWORD` |
+| API (OpenAI-compatible) | `http://127.0.0.1:8642` | Only works once `API_SERVER_*` is enabled |
+| 9router | `http://127.0.0.1:20128` | Router UI; on the internal network it is `http://9router:20128` |
+| claude-cli-adapter | `http://127.0.0.1:8082` | **No auth** — see the section below |
 
-Mặc định **cả hai chỉ bind vào loopback của host**. Vào dashboard từ máy khác qua SSH tunnel:
+Everything **binds to host loopback by default**. Reach the dashboard from another machine over an
+SSH tunnel:
 
 ```bash
 ssh -L 9119:127.0.0.1:9119 user@host
-# rồi mở http://127.0.0.1:9119 trên máy local
+# then open http://127.0.0.1:9119 locally
 ```
 
-### Nếu muốn phơi ra ngoài
+### Exposing it externally
 
-Đổi `HERMES_BIND_ADDR=0.0.0.0` trong `.env`. Trước khi làm, hiểu rõ:
+Set `HERMES_BIND_ADDR=0.0.0.0` in `.env`. Before you do, understand this:
 
-Dashboard public **không auth** chính là điểm xâm nhập của chiến dịch MCP-config persistence
-tháng 6/2026 — scanner internet tìm thấy dashboard phơi ra và điều khiển agent cắm SSH-key
-backdoor. Compose này đã cấu hình sẵn basic auth nên gate luôn bật, nhưng basic auth
-**không đủ** cho internet công cộng. Với public deploy, dùng OAuth (Nous Portal:
-`HERMES_DASHBOARD_OAUTH_CLIENT_ID`) hoặc self-hosted OIDC (`HERMES_DASHBOARD_OIDC_ISSUER` +
-`_CLIENT_ID`), hoặc để nguyên loopback và đi qua VPN/Tailscale.
+A public dashboard with **no auth** was the entry point for the June 2026 MCP-config persistence
+campaign — internet scanners found exposed dashboards and drove the agent into installing an SSH-key
+backdoor. This compose file ships basic auth configured, so the gate is always on, but basic auth is
+**not enough** for the public internet. For a public deploy use OAuth (Nous Portal:
+`HERMES_DASHBOARD_OAUTH_CLIENT_ID`) or self-hosted OIDC (`HERMES_DASHBOARD_OIDC_ISSUER` +
+`_CLIENT_ID`), or leave it on loopback and reach it over VPN/Tailscale.
 
-`HERMES_DASHBOARD_INSECURE` đã bị vô hiệu hoá — không còn cách nào tắt auth trên bind
-non-loopback.
+`HERMES_DASHBOARD_INSECURE` has been disabled upstream — there is no longer any way to turn auth off
+on a non-loopback bind.
 
 ---
 
-## Vận hành hằng ngày
+## Day-to-day operation
 
 ```bash
-docker compose logs -f                    # log realtime (gateway + dashboard)
-docker compose restart                    # restart cả container
-docker compose ps                         # trạng thái
+docker compose logs -f                    # live logs (gateway + dashboard)
+docker compose restart                    # restart the whole container
+docker compose ps                         # status
 
-docker exec hermes hermes logs --follow   # log Hermes có cấu trúc
-docker exec hermes hermes status          # báo "Manager: s6 (container supervisor)"
-docker exec -it hermes hermes             # mở CLI chat trong container đang chạy
+docker exec hermes hermes logs --follow   # structured Hermes logs
+docker exec hermes hermes status          # reports "Manager: s6 (container supervisor)"
+docker exec -it hermes hermes             # open the chat CLI inside the running container
 ```
 
-`docker exec hermes ...` tự động drop từ root xuống user `hermes` (UID 10000) nên file
-sinh ra có đúng quyền — không cần `--user`.
+`docker exec hermes ...` automatically drops from root to the `hermes` user (UID 10000), so files it
+creates get the right ownership — no `--user` needed.
 
-### Log nằm ở đâu
+### Where the logs are
 
-| Nguồn | Vị trí |
+| Source | Location |
 |---|---|
-| Gateway + dashboard, realtime | `docker compose logs -f` (xoay vòng 20MB × 5, mất khi `docker rm`) |
-| Gateway, bản bền theo profile | `~/.hermes/logs/gateways/<profile>/current` (rotated 10 × 1MB) |
-| Audit khởi động container | `~/.hermes/logs/container-boot.log` |
+| Gateway + dashboard, live | `docker compose logs -f` (rotated 20MB × 5, lost on `docker rm`) |
+| Gateway, durable per profile | `~/.hermes/logs/gateways/<profile>/current` (rotated 10 × 1MB) |
+| Container boot audit | `~/.hermes/logs/container-boot.log` |
 | `agent.log`, `errors.log` | `~/.hermes/logs/` |
 
-Chỉ file trên volume sống sót qua `docker rm`.
+Only files on the volume survive `docker rm`.
 
 ---
 
 ## Multi-profile
 
-Một container chạy được nhiều profile độc lập (SOUL, skills, memory, sessions riêng).
-Mỗi profile là một s6 service được giám sát, tự restart khi crash — **không cần thêm container**:
+One container runs any number of independent profiles (separate SOUL, skills, memory, sessions).
+Each profile is a supervised s6 service that restarts on crash — **no extra container needed**:
 
 ```bash
 docker exec hermes hermes profile create coder
@@ -155,13 +160,14 @@ docker exec hermes hermes -p coder gateway status
 docker exec hermes hermes profile delete coder
 ```
 
-Gateway đang chạy sẽ **tự bật lại** sau `docker compose restart` hoặc nâng cấp image.
-Chỉ khi bạn chủ động `hermes gateway stop` thì nó mới nằm im qua restart.
+A running gateway **comes back on its own** after `docker compose restart` or an image upgrade. Only
+an explicit `hermes gateway stop` keeps it down across restarts.
 
-**Dashboard chỉ cần một port cho mọi profile** — profile switcher trong UI gửi kèm profile đích.
+**The dashboard needs a single port for all profiles** — the profile switcher in the UI sends the
+target profile along with each request.
 
-**Client OpenAI-compatible thì khác:** mỗi profile có API server riêng và đều mặc định bind
-8642 → đụng nhau. Cấp port riêng trong `.env` *của chính profile đó*:
+**OpenAI-compatible clients are different:** every profile has its own API server and they all
+default to port 8642, so they collide. Give each one its own port in *that profile's* `.env`:
 
 ```bash
 docker exec hermes hermes profile create work
@@ -172,48 +178,50 @@ EOF
 docker exec hermes hermes -p work gateway restart
 ```
 
-Rồi publish thêm `- "127.0.0.1:8643:8643"` trong `docker-compose.yml`.
+Then publish `- "127.0.0.1:8643:8643"` in `docker-compose.yml`.
 
-> Đừng bao giờ đặt `API_SERVER_PORT` trong khối `environment:` của compose — giá trị global
-> sẽ ép mọi profile về cùng một port.
+> Never put `API_SERVER_PORT` in the compose `environment:` block — a global value forces every
+> profile onto the same port.
 
 ---
 
-## Nâng cấp
+## Upgrading
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-Data dir giữ nguyên. Container tự chạy config-schema migration và ghi backup có timestamp
-cạnh `config.yaml` / `.env` trước khi sửa. Muốn tự kiểm tra trước thì thêm
-`HERMES_SKIP_CONFIG_MIGRATION=1` vào `environment:`.
+The data directory is left alone. The container runs config-schema migrations itself and writes
+timestamped backups next to `config.yaml` / `.env` before touching them. To inspect the changes
+first, add `HERMES_SKIP_CONFIG_MIGRATION=1` to `environment:`.
 
-Ở production nên pin `HERMES_IMAGE_TAG` về version cụ thể thay vì `latest`.
+In production, pin `HERMES_IMAGE_TAG` to a specific version instead of `latest`.
 
 ---
 
 ## Backup
 
-Toàn bộ state nằm ở một thư mục:
+All state lives in bind-mounted directories; there are no named volumes:
 
 ```bash
 docker compose stop
-tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes
+tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes .9router .claude-adapter
 docker compose start
 ```
 
+After restoring, put the ownership back: `sudo chown -R 10001:10001 ~/.claude-adapter`.
+
 ---
 
-## Cấu hình thêm
+## Further configuration
 
-`config.yaml` nằm ở `~/.hermes/config.yaml`.
+`config.yaml` lives at `~/.hermes/config.yaml`.
 
-### Chặn tool-loop cho gateway không người trực
+### Tool-loop circuit breaker for unattended gateways
 
-Mặc định Hermes chỉ cảnh báo khi agent kẹt trong vòng lặp gọi tool — hợp lý cho CLI có người
-ngồi xem, nhưng với gateway chạy nền thì cảnh báo không dừng được gì. Bật circuit-breaker:
+By default Hermes only warns when an agent gets stuck in a tool-call loop — reasonable for a CLI with
+someone watching, useless for a gateway running unattended. Enable the circuit breaker:
 
 ```yaml
 tool_loop_guardrails:
@@ -223,39 +231,85 @@ tool_loop_guardrails:
     idempotent_no_progress: 5
 ```
 
-### Trỏ vào inference server local (vLLM / Ollama)
+### Pointing at a local inference server (vLLM / Ollama)
 
-Server chạy trên **chính host này** (Linux):
+Server running on **this host** (Linux):
 
 ```yaml
 model:
   provider: custom
   model: my-model
-  base_url: http://172.17.0.1:8000/v1   # docker0 gateway; hoặc host.docker.internal trên macOS
+  base_url: http://172.17.0.1:8000/v1   # docker0 gateway; host.docker.internal on macOS
   api_key: "none"
 ```
 
-Server chạy trong **container khác**: cho cả hai vào chung network rồi dùng **tên container**
-làm hostname (`http://vllm:8000/v1`) — không dùng `localhost`, đó là chính container Hermes.
-Không có dấu `/` cuối `base_url`. `model` phải khớp `--served-model-name`.
+Server running in **another container**: put both on the same network and use the **container name**
+as the hostname (`http://vllm:8000/v1`) — not `localhost`, which is the Hermes container itself. No
+trailing `/` on `base_url`. `model` must match `--served-model-name`.
 
-Kiểm tra: `docker exec hermes curl -s http://vllm:8000/v1/models`
+Check it: `docker exec hermes curl -s http://vllm:8000/v1/models`
+
+### claude-cli-adapter
+
+The `claude-cli-adapter` container wraps the `claude` CLI in an Anthropic/OpenAI-style HTTP API. It
+sits on the same `hermes-net` network, so it is reachable by container name — point Hermes at it like
+any other provider:
+
+```yaml
+model:
+  provider: custom
+  model: cc/claude-sonnet-5
+  base_url: http://claude-cli-adapter:8082/v1
+  api_key: "none"
+```
+
+The adapter's default backend is 9router (`http://9router:20128`), which needs
+`ADAPTER_ANTHROPIC_AUTH_TOKEN` in `.env` — an API key generated in the 9router UI. To use a
+subscription instead of a token, clear that value and set `ADAPTER_CLAUDE_CODE_OAUTH_TOKEN`
+(generated with `claude setup-token`). Setting `ADAPTER_ANTHROPIC_AUTH_TOKEN` and
+`ADAPTER_ANTHROPIC_API_KEY` at the same time makes the container **refuse to start** — the CLI would
+send two auth headers.
+
+> The adapter has **no authentication of its own**: it ignores the API key and serves anyone who can
+> reach it. That is why `ADAPTER_BIND_ADDR` is a separate variable, deliberately decoupled from
+> `HERMES_BIND_ADDR` — opening the dashboard to the LAN must not drag the adapter along. Only set it
+> to `0.0.0.0` behind a reverse proxy that authenticates.
+
+The `claude` CLI's state (credentials + `.claude.json`) lives in `ADAPTER_DATA_DIR`, default
+`~/.claude-adapter`, mounted at `/home/app`. The container runs as **UID 10001** and has **no
+`PUID`/`PGID`** like hermes does — it starts directly as the `app` user, so it cannot chown anything
+itself. On Linux that directory must be owned by `10001:10001`:
+
+```bash
+sudo chown -R 10001:10001 ~/.claude-adapter
+```
+
+`setup.sh` handles this (asking for sudo if needed). Skip it and Claude Code cannot write its
+credentials, failing with a very unhelpful permission error. On macOS, Docker Desktop maps ownership
+for you and this is unnecessary.
+
+Source lives in its own repo,
+[`0xphuong/claude-cli-adapter`](https://github.com/0xphuong/claude-cli-adapter); this compose file
+only runs the published image. To build from source, use the compose file in that repo.
 
 ---
 
-## Cài thêm tool vào container
+## Installing extra tools in the container
 
-`/opt/hermes` là install tree **bất biến**, read-only với runtime. Mọi thứ mutable thuộc về
-`/opt/data`.
+`/opt/hermes` is an **immutable** install tree, read-only to the runtime. Everything mutable belongs
+under `/opt/data`.
 
-- **npm / PyPI** → bảo Hermes chạy qua `npx` / `uvx` và ghi nhớ lệnh vào memory. Config đặt
-  dưới `/opt/data/<tool>/`.
-- **apt package / binary** → dạy Hermes lệnh cài, bảo nó nhớ. Tồn tại hết đời container.
-- **Cần có sẵn mỗi lần start** → build image dẫn xuất `FROM nousresearch/hermes-agent:latest`,
-  `USER root` → cài → `USER hermes`. Rồi đổi `image:` trong compose.
-- **Tool kèm service riêng** (DB, queue) → chạy sidecar cùng network, gọi qua tên container.
+- **npm / PyPI** → tell Hermes to run it through `npx` / `uvx` and to remember the command in memory.
+  Config goes under `/opt/data/<tool>/`.
+- **apt packages / binaries** → teach Hermes the install command and have it remember. Lasts as long
+  as the container does.
+- **Must be present on every start** → build a derived image `FROM nousresearch/hermes-agent:latest`,
+  `USER root` → install → `USER hermes`. Then change `image:` in the compose file.
+- **Tools that need their own service** (DB, queue) → run a sidecar on the same network and call it
+  by container name.
 
-Skill CLI lưu credential dưới `~` phải init đúng HOME của subprocess. Ví dụ `xurl`:
+CLI skills that store credentials under `~` must be initialised with the subprocess's real HOME. For
+example, `xurl`:
 
 ```bash
 docker exec -it hermes env HOME=/opt/data/home xurl auth
@@ -266,22 +320,22 @@ docker exec hermes env HOME=/opt/data/home xurl auth status
 
 ## Troubleshooting
 
-| Triệu chứng | Xử lý |
+| Symptom | Fix |
 |---|---|
-| Compose báo `required variable ... is missing` | Chưa `cp .env.example .env` hoặc chưa điền credential dashboard |
-| Container exit ngay | `docker compose logs` — thường do chưa chạy `setup`, hoặc trùng port |
-| `Permission denied` trên `~/.hermes` | Runtime chạy UID 10000. Đặt `HERMES_PUID`/`HERMES_PGID` khớp chủ thư mục (`id -u`, `id -g`) |
-| Browser tools chết lặng | Thiếu shared memory — compose đã set `shm_size: 1gb`, kiểm tra chưa bị override |
-| Dashboard không vào được | Đang bind loopback (đúng thiết kế) — dùng SSH tunnel |
-| Gateway kẹt sau sự cố mạng | `docker compose restart` |
+| Compose says `required variable ... is missing` | You skipped `cp .env.example .env`, or left the dashboard credentials blank |
+| Container exits immediately | `docker compose logs` — usually `setup` was never run, or a port is taken |
+| `Permission denied` on `~/.hermes` | The runtime is UID 10000. Set `HERMES_PUID`/`HERMES_PGID` to match the directory owner (`id -u`, `id -g`) |
+| Browser tools fail silently | Missing shared memory — compose sets `shm_size: 1gb`, check nothing overrides it |
+| Dashboard unreachable | It is bound to loopback by design — use an SSH tunnel |
+| Gateway stuck after a network incident | `docker compose restart` |
 
-Kiểm tra version image: `docker run --rm nousresearch/hermes-agent:latest version`
+Check the image version: `docker run --rm nousresearch/hermes-agent:latest version`
 
 ---
 
-## Cảnh báo
+## Warnings
 
-**Không bao giờ chạy hai container Hermes trỏ vào cùng một data directory.** Session files và
-memory store không hỗ trợ ghi đồng thời — sẽ hỏng dữ liệu.
+**Never run two Hermes containers against the same data directory.** Session files and the memory
+store do not support concurrent writes — the data will be corrupted.
 
-**Không commit `.env`.** Đã có trong `.gitignore`.
+**Never commit `.env`.** It is already in `.gitignore`.

@@ -1,16 +1,16 @@
-# Secrets — KHONG BAO GIO commit
+# Secrets — NEVER commit
 .env
 *.env
 !.env.example
 
-# Override cuc bo cua tung may
+# Per-machine local overrides
 docker-compose.override.yml
 docker-compose.*.local.yml
 
-# Cai dat cuc bo cua Claude Code
+# Claude Code local settings
 .claude/settings.local.json
 
-# Neu ai do lo dat thu muc du lieu ngay trong repo
+# In case someone drops a data directory inside the repo
 .hermes/
 data/
 

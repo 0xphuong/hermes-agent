@@ -5,8 +5,8 @@ services:
     restart: unless-stopped
     command: gateway run
 
-    # Toàn bộ state (config, .env, sessions, memories, skills, logs) nằm ở /opt/data.
-    # Image là stateless — nâng cấp không mất gì.
+    # All state (config, .env, sessions, memories, skills, logs) lives under
+    # /opt/data. The image is stateless — upgrading loses nothing.
     volumes:
       - ${HERMES_DATA_DIR:-~/.hermes}:/opt/data
 
@@ -14,58 +14,62 @@ services:
       - hermes-net
 
     ports:
-      # Mặc định bind vào loopback của host. Vào dashboard qua SSH tunnel:
+      # Bound to host loopback by default. Reach the dashboard over an SSH tunnel:
       #   ssh -L 9119:127.0.0.1:9119 user@host
-      # Muốn phơi ra LAN/internet: đổi HERMES_BIND_ADDR=0.0.0.0 trong .env
-      # VÀ đọc kỹ phần auth ở README trước.
+      # To expose it to the LAN/internet, set HERMES_BIND_ADDR=0.0.0.0 in .env
+      # AND read the auth section of the README first.
       - "${HERMES_BIND_ADDR:-127.0.0.1}:${HERMES_API_PORT:-8642}:8642"    # OpenAI-compatible API + health
       - "${HERMES_BIND_ADDR:-127.0.0.1}:${HERMES_DASHBOARD_PORT:-9119}:9119"  # web dashboard
 
     environment:
       # --- Dashboard ---------------------------------------------------------
       - HERMES_DASHBOARD=1
-      # Trong container dashboard bind 0.0.0.0 (mặc định) để port publish tới được.
-      # Vì bind non-loopback => auth gate BẮT BUỘC có provider, nếu không container
-      # fail closed lúc startup. Provider đơn giản nhất là username/password:
-      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:?dat HERMES_DASHBOARD_USER trong .env}
-      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?dat HERMES_DASHBOARD_PASSWORD trong .env}
-      # Giữ session đăng nhập ổn định qua restart container:
-      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${HERMES_DASHBOARD_SECRET:?dat HERMES_DASHBOARD_SECRET trong .env}
+      # Inside the container the dashboard binds 0.0.0.0 (the default) so the
+      # published port can reach it. A non-loopback bind makes the auth gate
+      # MANDATORY — without a provider the container fails closed at startup.
+      # The simplest provider is username/password:
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${HERMES_DASHBOARD_USER:?set HERMES_DASHBOARD_USER in .env}
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_PASSWORD:?set HERMES_DASHBOARD_PASSWORD in .env}
+      # Keeps login sessions valid across container restarts:
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${HERMES_DASHBOARD_SECRET:?set HERMES_DASHBOARD_SECRET in .env}
 
       # --- Claude Code -------------------------------------------------------
-      # Token OAuth cho CLI `claude` (sinh bang `claude setup-token`).
-      # De trong => phai login thu cong trong container.
+      # OAuth token for the `claude` CLI (generated with `claude setup-token`).
+      # Leave empty to log in manually inside the container instead.
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
 
-      # --- Quyền file trên volume -------------------------------------------
-      # Runtime chạy UID 10000. Nếu thư mục data trên host thuộc user khác
-      # (rất hay gặp trên NAS / bind mount), set về UID/GID của chủ thư mục đó.
+      # --- Volume file ownership ---------------------------------------------
+      # The runtime runs as UID 10000. If the host data directory belongs to a
+      # different user (common on NAS boxes and bind mounts), set these to that
+      # directory's UID/GID.
       - PUID=${HERMES_PUID:-10000}
       - PGID=${HERMES_PGID:-10000}
 
-      # --- API server (tùy chọn) --------------------------------------------
-      # Chỉ bật khi cần client OpenAI-compatible (Open WebUI, LobeChat...) hoặc
-      # tool ngoài gọi vào. Bỏ comment cả 3 dòng cùng lúc.
+      # --- API server (optional) ---------------------------------------------
+      # Only needed for OpenAI-compatible clients (Open WebUI, LobeChat, ...) or
+      # external tools calling in. Uncomment all three lines together.
       # - API_SERVER_ENABLED=true
       # - API_SERVER_HOST=0.0.0.0
       # - API_SERVER_KEY=${HERMES_API_KEY:?openssl rand -hex 32}
 
-      # --- Model / platform keys --------------------------------------------
-      # KHÔNG khai ở đây. Chúng thuộc về ~/.hermes/.env (do `hermes setup` ghi),
-      # nằm trên volume nên sống sót qua mọi lần recreate container.
-      # Chỉ forward qua đây khi lấy từ secrets-manager và không muốn ghi ra đĩa:
+      # --- Model / platform keys ---------------------------------------------
+      # Do NOT declare them here. They belong to ~/.hermes/.env (written by
+      # `hermes setup`), which lives on the volume and survives every container
+      # recreate. Only forward them here when they come from a secrets manager
+      # and must not be written to disk:
       # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # - OPENAI_API_KEY=${OPENAI_API_KEY}
       # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 
-    # Playwright/Chromium cần shared memory, thiếu là browser tools chết lặng.
+    # Playwright/Chromium needs shared memory; without it browser tools die silently.
     shm_size: "1gb"
 
-    # s6 cần thời gian tắt sạch các gateway theo profile.
+    # s6 needs time to shut the per-profile gateways down cleanly.
     stop_grace_period: 30s
 
-    # docker logs không tự xoay vòng; gateway tee stdout vào đây nên sẽ phình.
-    # (Bản rotated bền vẫn nằm ở ~/.hermes/logs/gateways/<profile>/current)
+    # docker logs does not rotate on its own, and the gateway tees stdout into it,
+    # so it grows without bound.
+    # (The durable rotated copy still lives at ~/.hermes/logs/gateways/<profile>/current)
     logging:
       driver: json-file
       options:
@@ -78,9 +82,9 @@ services:
           memory: ${HERMES_MEMORY_LIMIT:-4G}
           cpus: "${HERMES_CPU_LIMIT:-2.0}"
 
-    # Healthcheck: chỉ bật MỘT trong hai, tùy cấu hình.
+    # Healthcheck: enable exactly ONE of these, depending on your config.
     #
-    # (a) Hỏi thẳng supervisor s6 — chạy được kể cả khi API server tắt:
+    # (a) Ask the s6 supervisor directly — works even with the API server off:
     # healthcheck:
     #   test: ["CMD", "/command/s6-svstat", "-u", "/run/service/gateway-default"]
     #   interval: 30s
@@ -88,8 +92,8 @@ services:
     #   retries: 3
     #   start_period: 60s
     #
-    # (b) Gọi health endpoint — CHỈ dùng khi đã bật API_SERVER_ENABLED=true,
-    #     không thì container bị đánh dấu unhealthy vĩnh viễn:
+    # (b) Hit the health endpoint — ONLY with API_SERVER_ENABLED=true, otherwise
+    #     the container is marked unhealthy forever:
     # healthcheck:
     #   test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8642/health"]
     #   interval: 30s
@@ -98,7 +102,7 @@ services:
     #   start_period: 60s
 
   # ---------------------------------------------------------------------------
-  # 9router — LLM router. Hermes gọi tới bằng tên container: http://9router:20128
+  # 9router — LLM router. Hermes reaches it by container name: http://9router:20128
   # ---------------------------------------------------------------------------
   9router:
     image: decolua/9router:latest
@@ -111,12 +115,13 @@ services:
     volumes:
       - ${ROUTER_DATA_DIR:-~/.9router}:/app/data
 
-    # File riêng, KHÔNG dùng .env chung — .env chứa credential của hermes
-    # (dashboard password, CLAUDE_CODE_OAUTH_TOKEN) và env_file nap tat ca vao container.
+    # A dedicated file, NOT the shared .env — that one holds hermes credentials
+    # (dashboard password, CLAUDE_CODE_OAUTH_TOKEN) and env_file would load every
+    # single one of them into this container.
     env_file:
       - 9router.env
 
-    # Ghi de len gia tri trong 9router.env (compose uu tien environment hon env_file)
+    # Overrides the values in 9router.env (compose prefers environment over env_file)
     environment:
       DATA_DIR: /app/data
       PORT: "20128"
@@ -141,8 +146,8 @@ services:
     container_name: headroom
     restart: unless-stopped
 
-    # 9router goi headroom qua network noi bo, khong can publish.
-    # Bo comment neu can truy cap truc tiep tu host de debug.
+    # 9router reaches headroom over the internal network; no need to publish it.
+    # Uncomment to reach it directly from the host for debugging.
     # ports:
     #   - "${HERMES_BIND_ADDR:-127.0.0.1}:8787:8787"
 
@@ -154,6 +159,84 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # claude-cli-adapter — wraps the `claude` CLI in an Anthropic/OpenAI-style API.
+  # Source: github.com/0xphuong/claude-cli-adapter (separate repo; this file only
+  # runs the published image). To build from source, use that repo's compose file
+  # rather than adding a `build:` here — the build context is outside this
+  # directory.
+  # ---------------------------------------------------------------------------
+  claude-adapter:
+    image: docker.io/binhphuong/claude-cli-adapter:${ADAPTER_IMAGE_TAG:-latest}
+    container_name: claude-cli-adapter
+    restart: unless-stopped
+
+    ports:
+      # The adapter has NO auth of its own — it ignores the API key and serves
+      # anyone who can reach it. Hence a dedicated variable rather than the
+      # shared HERMES_BIND_ADDR: opening hermes to the LAN must not drag the
+      # adapter along. Only set it to 0.0.0.0 behind a reverse proxy that
+      # authenticates.
+      - "${ADAPTER_BIND_ADDR:-127.0.0.1}:${ADAPTER_PORT:-8082}:8082"
+
+    environment:
+      # The container-side names are ANTHROPIC_*, but they read from ADAPTER_*
+      # in .env — that file is shared with hermes, and bare names would collide
+      # with its own model configuration.
+      #
+      # Empty means unset: the adapter's entrypoint drops empty credential
+      # variables, so `${...:-}` here cannot break auth-method selection.
+
+      # Token mode: point the CLI at 9router over the internal network. The
+      # default is the container name, not a host IP — same network, direct hop.
+      - ANTHROPIC_BASE_URL=${ADAPTER_ANTHROPIC_BASE_URL:-http://9router:20128}
+      - ANTHROPIC_AUTH_TOKEN=${ADAPTER_ANTHROPIC_AUTH_TOKEN:-}
+      # Use INSTEAD OF ANTHROPIC_AUTH_TOKEN for endpoints expecting an x-api-key
+      # header. Setting both makes the entrypoint refuse to start.
+      - ANTHROPIC_API_KEY=${ADAPTER_ANTHROPIC_API_KEY:-}
+      # Subscription mode: clear the two variables above and set this instead.
+      - CLAUDE_CODE_OAUTH_TOKEN=${ADAPTER_CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Model used when a client sends no "model" field. Behind 9router the model
+      # names are namespaced (e.g. cc/claude-sonnet-5); a plain Anthropic name 404s.
+      - ADAPTER_DEFAULT_MODEL=${ADAPTER_DEFAULT_MODEL:-}
+
+    volumes:
+      # The whole HOME, not just ~/.claude — Claude Code keeps state in BOTH
+      # ~/.claude/ (credentials, projects) and ~/.claude.json (config). Mounting
+      # only the directory loses the config file on every recreate.
+      #
+      # OWNERSHIP: this container runs as UID 10001 and has NO PUID/PGID like
+      # hermes — it starts directly as the `app` user and cannot chown anything.
+      # The host directory must be owned by 10001:10001 or Claude Code will not
+      # be able to write its credentials:
+      #   sudo chown -R 10001:10001 <directory>      (setup.sh does this for you)
+      - ${ADAPTER_DATA_DIR:-~/.claude-adapter}:/home/app
+
+    networks:
+      - hermes-net
+
+    depends_on:
+      - 9router
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Every request spawns a `claude -p` Node process and the adapter imposes no
+    # concurrency limit — cap it here so a burst cannot exhaust the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "${ADAPTER_CPU_LIMIT:-2.0}"
+          memory: ${ADAPTER_MEMORY_LIMIT:-2G}
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   hermes-net:
