@@ -251,17 +251,23 @@ Check it: `docker exec hermes curl -s http://vllm:8000/v1/models`
 
 ### claude-cli-adapter
 
-The `claude-cli-adapter` container wraps the `claude` CLI in an Anthropic/OpenAI-style HTTP API. It
-sits on the same `hermes-net` network, so it is reachable by container name — point Hermes at it like
-any other provider:
+The `claude-cli-adapter` container wraps the `claude` CLI in an **Anthropic Messages API** — it serves
+`POST /v1/messages`, `GET /v1/models` and `GET /health`, and nothing else. There is no
+`/v1/chat/completions`, so it goes in the **anthropic** provider block, not `provider: custom`
+(which expects an OpenAI-shaped endpoint).
+
+It sits on the same `hermes-net` network, so Hermes reaches it by container name:
 
 ```yaml
-model:
-  provider: custom
-  model: cc/claude-sonnet-5
-  base_url: http://claude-cli-adapter:8082/v1
-  api_key: "none"
+providers:
+  anthropic:
+    base_url: http://claude-cli-adapter:8082   # no /v1 suffix — the SDK appends it
+    api_key: dummy                             # required by the SDK, ignored by the adapter
+    model: cc/claude-sonnet-5
 ```
+
+Use port **8082** here, not `ADAPTER_PORT` — that one only maps the published host port. Inside the
+network the container always listens on 8082.
 
 The adapter's default backend is 9router (`http://9router:20128`), which needs
 `ADAPTER_ANTHROPIC_AUTH_TOKEN` in `.env` — an API key generated in the 9router UI. To use a
@@ -291,6 +297,31 @@ for you and this is unnecessary.
 Source lives in its own repo,
 [`0xphuong/claude-cli-adapter`](https://github.com/0xphuong/claude-cli-adapter); this compose file
 only runs the published image. To build from source, use the compose file in that repo.
+
+#### Smoke-testing the adapter
+
+```bash
+# 1. Liveness, from the host
+curl -s http://127.0.0.1:8082/health
+
+# 2. Model list (a hardcoded stub — it does NOT reflect ADAPTER_DEFAULT_MODEL)
+curl -s http://127.0.0.1:8082/v1/models
+
+# 3. A real completion. Every request spawns a fresh `claude -p`, so expect
+#    tens of seconds, not milliseconds.
+curl -s -X POST http://127.0.0.1:8082/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: dummy' \
+  -d '{"model":"cc/claude-sonnet-5","max_tokens":64,
+       "messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
+
+# 4. The path Hermes actually takes — by container name, over hermes-net
+docker exec hermes curl -s http://claude-cli-adapter:8082/health
+```
+
+If step 3 fails but step 1 works, the problem is the backend rather than the adapter: check
+`docker compose logs claude-adapter` and confirm `ADAPTER_ANTHROPIC_AUTH_TOKEN` is a key 9router
+recognises and that the model name exists there.
 
 ---
 
