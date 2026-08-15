@@ -400,38 +400,65 @@ if [ ! -f "$HERMES_DATA_DIR/.env" ]; then
   fi
 fi
 
+# ----------------------------------------------------------------- start ----
+info "Starting the stack"
+if [ "$WITH_CLAUDE_CODE" = 1 ]; then
+  docker compose up -d --build
+else
+  docker compose up -d
+fi
+
+info "Waiting for the containers to settle"
+for _ in $(seq 1 30); do
+  sleep 2
+  if [ -z "$(docker compose ps --status restarting -q 2>/dev/null)" ]; then
+    break
+  fi
+done
+
 # ------------------------------------------------- wire hermes -> proxy ----
-# Point hermes' model config at the in-container claude-proxy. Only meaningful
-# for the image that actually carries the proxy, and only after the wizard has
-# produced a config.yaml to patch.
+# Point hermes' model config at the in-container claude-proxy.
 #
-# Asking for --with-claude-code IS the request to route hermes through the
-# proxy, so pointing the model block at it is the expected outcome, not an
-# intrusion. The wizard has just written its own provider (OpenRouter, say) a
-# few steps earlier; treating that as a choice to protect meant the flag
-# silently did half its job and hermes still called out to the internet.
+# Runs INSIDE the container, and only after the stack is up. Two reasons, both
+# learned the hard way:
 #
-# So: write it. Confirm first when there is a terminal and the existing block
-# points somewhere real, because replacing a working provider deserves a
-# glance — but default to yes, and take a backup either way.
+#   * config.yaml does not exist until hermes has booted once. Patching before
+#     `up -d` found nothing, warned, and returned — then hermes started and
+#     wrote its own default (OpenRouter), so --with-claude-code built the image,
+#     started the proxy, and left hermes calling the internet.
+#   * the runtime chowns /opt/data to UID 10000 mode 0700. From the host,
+#     $HERMES_DATA_DIR is unreadable, so even `[ -f config.yaml ]` is false and
+#     every host-side edit fails with permission denied.
+#
+# Asking for --with-claude-code IS the request to route through the proxy, so
+# writing the block is the expected outcome. Confirm first when a terminal is
+# attached and the existing base_url points at something real; back up either
+# way.
 CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-sonnet-4-6}"
 CLAUDE_PROXY_KEY_ENV=HERMES_CLAUDE_PROXY_API_KEY
 
-wire_claude_proxy() {
-  local cfg="$HERMES_DATA_DIR/config.yaml" tmp cur block entry reply
-  [ -f "$cfg" ] || { warn "no $cfg yet — run the wizard, then re-run setup.sh"; return 0; }
+# Read a value out of the container's config.yaml. Empty when absent.
+proxy_cfg_get() {
+  docker exec -u hermes hermes awk "$1" /opt/data/config.yaml 2>/dev/null || true
+}
 
-  # base_url of the current model block, empty when there is no block.
-  cur="$(awk '
+wire_claude_proxy() {
+  local cur reply
+
+  if ! docker exec -u hermes hermes test -f /opt/data/config.yaml 2>/dev/null; then
+    warn "hermes has not written config.yaml yet — re-run setup.sh once it has"
+    return 0
+  fi
+
+  # shellcheck disable=SC2016  # awk program: $1/$2 are awk fields, not shell
+  cur="$(proxy_cfg_get '
     /^model:/            { inblk = 1; next }
     inblk && /^[^ \t#]/  { inblk = 0 }
     inblk && $1 == "base_url:" { print $2; exit }
-  ' "$cfg")"
+  ')"
 
   case "$cur" in
-    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*)
-      # Nothing there, or already ours — just write it.
-      ;;
+    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*) ;;
     *)
       if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
         printf '\n  %sHermes currently calls%s %s\n' "$C_BOLD" "$C_RESET" "$cur"
@@ -452,96 +479,83 @@ wire_claude_proxy() {
       ;;
   esac
 
-  cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M%S)"
+  # The patch itself, run as the hermes user so the files keep their ownership.
+  # Values arrive through the environment: interpolating them into the script
+  # would collide with awk's own $1/$0.
+  if docker exec -i -u hermes \
+       -e M="$CLAUDE_PROXY_MODEL" \
+       -e P="$ADAPTER_PROXY_PORT" \
+       -e K="$CLAUDE_PROXY_KEY_ENV" \
+       hermes sh -s <<'INNER'
+set -e
+cfg=/opt/data/config.yaml
+cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M%S)"
 
-  # `provider: local` names an entry in custom_providers — the pair has to
-  # agree, so both are written together. api_mode MUST be anthropic_messages:
-  # the proxy serves /v1/messages only, and chat_completions 404s every call.
-  block="model:
-  default: $CLAUDE_PROXY_MODEL
-  provider: local
-  base_url: http://localhost:$ADAPTER_PROXY_PORT/v1
-  api_key: \${$CLAUDE_PROXY_KEY_ENV}
-  api_mode: anthropic_messages"
+# `provider: local` names an entry in custom_providers, so the pair is written
+# together. api_mode MUST be anthropic_messages: the proxy serves /v1/messages
+# only, and chat_completions 404s every call.
+blk=$(mktemp); ent=$(mktemp)
+{
+  echo "model:"
+  echo "  default: $M"
+  echo "  provider: local"
+  echo "  base_url: http://localhost:$P/v1"
+  echo "  api_key: \${$K}"
+  echo "  api_mode: anthropic_messages"
+} > "$blk"
+{
+  echo "  - name: local"
+  echo "    base_url: http://localhost:$P/v1"
+  echo "    key_env: $K"
+  echo "    model: $M"
+  echo "    api_mode: anthropic_messages"
+} > "$ent"
 
-  entry="  - name: local
-    base_url: http://localhost:$ADAPTER_PROXY_PORT/v1
-    key_env: $CLAUDE_PROXY_KEY_ENV
-    model: $CLAUDE_PROXY_MODEL
-    api_mode: anthropic_messages"
+# Replace the whole model block, leaving every other byte — and its comments —
+# untouched. Appends when the file has no such block. The text goes through a
+# file because `awk -v` cannot hold a newline.
+tmp=$(mktemp)
+awk -v blkfile="$blk" '
+  BEGIN             { while ((getline l < blkfile) > 0) b = b l "\n"; sub(/\n$/, "", b) }
+  /^model:/         { print b; inblk = 1; seen = 1; next }
+  inblk && /^[ \t]/ { next }
+  inblk             { inblk = 0 }
+                    { print }
+  END               { if (!seen) print b }
+' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
 
-  # The blocks go through files, never `awk -v`: a -v assignment cannot hold a
-  # newline. BSD awk rejects it outright ("newline in string") and the edit is
-  # silently skipped, which is worse than a hard failure — the script would go
-  # on to report success over an unmodified config.
-  local blkfile entfile
-  blkfile="$(mktemp)"; printf '%s\n' "$block" > "$blkfile"
-  entfile="$(mktemp)"; printf '%s\n' "$entry" > "$entfile"
-
-  # Replace the whole model block, leaving every other byte of the file — and
-  # its comments — untouched. Appends the block when the file has none.
-  tmp="$(mktemp)"
-  awk -v blkfile="$blkfile" '
-    BEGIN                { while ((getline l < blkfile) > 0) blk = blk l "\n"
-                           sub(/\n$/, "", blk) }
-    /^model:/            { print blk; inblk = 1; seen = 1; next }
-    inblk && /^[ \t]/    { next }
-    inblk                { inblk = 0 }
+if ! grep -qE '^[[:space:]]+- name: local[[:space:]]*$' "$cfg"; then
+  awk -v entfile="$ent" '
+    BEGIN                { while ((getline l < entfile) > 0) e = e l "\n"; sub(/\n$/, "", e) }
+    /^custom_providers:/ { print; print e; seen = 1; next }
                          { print }
-    END                  { if (!seen) print blk }
-  ' "$cfg" > "$tmp" || die "failed to patch the model block in $cfg"
-  mv "$tmp" "$cfg"
+    END                  { if (!seen) { print "custom_providers:"; print e } }
+  ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+fi
 
-  if grep -qE '^[[:space:]]+- name: local[[:space:]]*$' "$cfg"; then
-    ok "custom_providers already has 'local' — kept as is"
+# The proxy ignores the key, but hermes refuses to start a provider whose
+# key_env resolves to nothing.
+env=/opt/data/.env
+[ -f "$env" ] || : > "$env"
+grep -q "^$K=" "$env" || echo "$K=dummy" >> "$env"
+
+grep -q '^model:' "$cfg"
+rm -f "$blk" "$ent" "$tmp"
+INNER
+  then
+    ok "model -> http://localhost:$ADAPTER_PROXY_PORT/v1 ($CLAUDE_PROXY_MODEL)"
+    ok "restarting hermes so it picks the new config up"
+    docker compose restart hermes >/dev/null 2>&1 || warn "could not restart hermes — do it by hand"
   else
-    tmp="$(mktemp)"
-    awk -v entfile="$entfile" '
-      BEGIN                { while ((getline l < entfile) > 0) e = e l "\n"
-                             sub(/\n$/, "", e) }
-      /^custom_providers:/ { print; print e; seen = 1; next }
-                           { print }
-      END                  { if (!seen) { print "custom_providers:"; print e } }
-    ' "$cfg" > "$tmp" || die "failed to add the custom_providers entry in $cfg"
-    mv "$tmp" "$cfg"
-    ok "added custom_providers entry 'local'"
+    warn "could not patch config.yaml inside the container"
   fi
-  rm -f "$blkfile" "$entfile"
-
-  grep -q '^model:' "$cfg" || die "model block missing from $cfg after patching — restore the .bak file"
-
-  # The proxy ignores the key entirely, but hermes refuses to start a provider
-  # whose key_env resolves to nothing.
-  if [ -f "$HERMES_DATA_DIR/.env" ] \
-     && [ -z "$(get_kv "$CLAUDE_PROXY_KEY_ENV" "$HERMES_DATA_DIR/.env")" ]; then
-    set_kv "$HERMES_DATA_DIR/.env" "$CLAUDE_PROXY_KEY_ENV" dummy
-    ok "set $CLAUDE_PROXY_KEY_ENV=dummy in $HERMES_DATA_DIR/.env (the proxy ignores it)"
-  fi
-
-  ok "model -> http://localhost:$ADAPTER_PROXY_PORT/v1 ($CLAUDE_PROXY_MODEL)"
 }
 
-if [ "$WITH_CLAUDE_CODE" = 1 ]; then
+if [ "$WITH_CLAUDE_CODE" = 1 ] && [ "$NO_START" = 0 ]; then
   ADAPTER_PROXY_PORT="$(get_kv CLAUDE_PROXY_PORT .env)"; : "${ADAPTER_PROXY_PORT:=8082}"
   info "Wiring hermes to claude-proxy"
   wire_claude_proxy
 fi
-
-# ----------------------------------------------------------------- start ----
-info "Starting the stack"
-if [ "$WITH_CLAUDE_CODE" = 1 ]; then
-  docker compose up -d --build
-else
-  docker compose up -d
-fi
-
-info "Waiting for the containers to settle"
-for _ in $(seq 1 30); do
-  sleep 2
-  if [ -z "$(docker compose ps --status restarting -q 2>/dev/null)" ]; then
-    break
-  fi
-done
 
 # --------------------------------------------------------------- summary ----
 BIND_ADDR="$(get_kv HERMES_BIND_ADDR .env)";        : "${BIND_ADDR:=127.0.0.1}"
@@ -639,6 +653,6 @@ printf '  docker compose down                 # stop the stack\n'
 printf '  docker exec -it hermes hermes       # open the chat CLI\n'
 printf '  docker exec hermes hermes status    # gateway status\n'
 if [ "$WITH_CLAUDE_CODE" = 1 ]; then
-  printf '  docker exec -it hermes env HOME=/opt/data/home claude   # the claude CLI\n'
+  printf '  docker exec -it -u hermes hermes claude                 # log the claude CLI in\n'
 fi
 printf '\n'
