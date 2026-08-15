@@ -208,8 +208,21 @@ ssh -L 9119:127.0.0.1:9119 user@host
 
 ### Exposing it externally
 
-Reinstall with `HERMES_BIND_ADDR=0.0.0.0` set in the environment — there is no `.env` left on disk
-to edit. Before you do, understand this:
+Setup asks at install time — there is no `.env` left on disk to edit afterwards:
+
+```
+  Who can reach the dashboard?
+    1  127.0.0.1  this host only — reach it over an SSH tunnel (default)
+    2  0.0.0.0    anything that can route to this machine
+```
+
+Or skip the question by setting it in the environment:
+
+```bash
+HERMES_BIND_ADDR=0.0.0.0 bash -c 'curl -fsSL .../install.sh | bash'
+```
+
+Before picking 2, understand this:
 
 A public dashboard with **no auth** was the entry point for the June 2026 MCP-config persistence
 campaign — internet scanners found exposed dashboards and drove the agent into installing an SSH-key

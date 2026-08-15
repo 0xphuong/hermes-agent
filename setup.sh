@@ -364,6 +364,43 @@ else
   [ -n "$(get_kv HERMES_DASHBOARD_USER .env)" ] || set_kv .env HERMES_DASHBOARD_USER admin
 fi
 
+# ------------------------------------------------------------ bind addr ----
+# Asked at install time because there is no `.env` left to edit afterwards —
+# the working directory goes away when this finishes.
+#
+# Precedence: an explicit HERMES_BIND_ADDR from the environment wins, then a
+# value already in .env from an earlier run, then the question.
+if [ -n "${HERMES_BIND_ADDR:-}" ]; then
+  set_kv .env HERMES_BIND_ADDR "$HERMES_BIND_ADDR"
+  ok "bind address $HERMES_BIND_ADDR (from the environment)"
+elif [ "$(get_kv HERMES_BIND_ADDR .env)" != "127.0.0.1" ] \
+     && [ -n "$(get_kv HERMES_BIND_ADDR .env)" ]; then
+  ok "bind address $(get_kv HERMES_BIND_ADDR .env) — keeping the current value"
+elif [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
+  printf '\n  %sWho can reach the dashboard?%s\n' "$C_BOLD" "$C_RESET"
+  printf '    %s1%s  127.0.0.1  this host only — reach it over an SSH tunnel %s(default)%s\n' \
+    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+  printf '    %s2%s  0.0.0.0    anything that can route to this machine\n' "$C_BOLD" "$C_RESET"
+  printf '\n    %sBefore picking 2:%s an exposed dashboard was the entry point for the June 2026\n' \
+    "$C_YELLOW" "$C_RESET"
+  printf '    MCP-config persistence campaign. Basic auth is on and cannot be turned off, but it\n'
+  printf '    is not enough for the public internet — put a VPN or an authenticating proxy first.\n'
+  printf '\n    Choice [1]: '
+  { IFS= read -r reply < /dev/tty; } 2>/dev/null || reply=""
+  case "$reply" in
+    2) set_kv .env HERMES_BIND_ADDR 0.0.0.0
+       warn "bind address 0.0.0.0 — the dashboard is reachable from the network"
+       ;;
+    *) set_kv .env HERMES_BIND_ADDR 127.0.0.1
+       ok "bind address 127.0.0.1 (loopback only)"
+       ;;
+  esac
+  printf '\n'
+else
+  set_kv .env HERMES_BIND_ADDR 127.0.0.1
+  ok "bind address 127.0.0.1 (loopback only)"
+fi
+
 # ---------------------------------------------------------------- router ----
 # Hermes is the product; 9router is an optional LLM router in front of it, and
 # headroom is 9router's own dependency. Default is hermes alone.
