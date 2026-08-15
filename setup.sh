@@ -234,24 +234,38 @@ fi
 # Hermes is the product; 9router is an optional LLM router in front of it, and
 # headroom is 9router's own dependency. Default is hermes alone.
 #
-# An existing install answers for itself: if 9router.env is already there the
-# router was chosen before, and a re-run must not quietly tear it down.
+# A leftover 9router.env shifts the DEFAULT to yes — it never answers on the
+# user's behalf. Deciding for them means a directory that happens to still hold
+# a months-old 9router.env silently installs two extra services on what the
+# user is treating as a fresh install, and the only clue is one `ok` line
+# scrolling past. Ask either way; just start the cursor on the safe answer.
 if [ -z "$WITH_ROUTER" ]; then
-  if [ -f 9router.env ]; then
-    WITH_ROUTER=1
-    ok "9router.env exists — keeping 9router in this deployment"
-  elif [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
+  if [ -f 9router.env ]; then router_default=1; else router_default=0; fi
+
+  if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
     printf '\n  %sAlso install 9router?%s %s(LLM router + headroom; hermes does not need it)%s\n' \
       "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
-    printf '    Install it? [y/N] '
+    if [ "$router_default" = 1 ]; then
+      printf '    %sThis directory already has a 9router.env from an earlier install.%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '    Install it? [Y/n] '
+    else
+      printf '    Install it? [y/N] '
+    fi
     IFS= read -r reply < /dev/tty || reply=""
     case "$reply" in
       [Yy]*) WITH_ROUTER=1 ;;
-      *)     WITH_ROUTER=0 ;;
+      [Nn]*) WITH_ROUTER=0 ;;
+      *)     WITH_ROUTER="$router_default" ;;   # bare Enter takes the default
     esac
     printf '\n'
   else
-    WITH_ROUTER=0
+    # No terminal to ask on. Keeping a configured router is the conservative
+    # choice here: tearing one down unasked is worse than leaving it up.
+    WITH_ROUTER="$router_default"
+    if [ "$WITH_ROUTER" = 1 ]; then
+      ok "9router.env exists and there is no terminal to ask on — keeping 9router"
+    fi
   fi
 fi
 
