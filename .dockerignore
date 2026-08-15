@@ -1,0 +1,16 @@
+# Everything in the build context is uploaded to the Docker daemon and can land
+# in the build cache, whether or not any COPY references it. On a deployed host
+# this directory holds real secrets, so the default is deny-all and the build
+# opts back in.
+#
+#   .env         dashboard password, CLAUDE_CODE_OAUTH_TOKEN
+#   9router.env  JWT_SECRET, API_KEY_SECRET, INITIAL_PASSWORD, MACHINE_ID_SALT
+#
+# Both are git-ignored, which says nothing about the build context.
+
+*
+
+# The only path the Dockerfile copies. Re-included at the top level on purpose:
+# `*` excludes the `docker` directory itself, and re-including a nested path
+# under an excluded parent is the classic way to end up with an empty COPY.
+!docker

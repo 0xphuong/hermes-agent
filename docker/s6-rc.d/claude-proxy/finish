@@ -1,0 +1,25 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# claude-proxy finish script. Companion to ./run, same contract as the
+# dashboard service's finish script.
+#
+# When CLAUDE_PROXY_ENABLED is falsy, ./run exits 0 immediately. Without this
+# script s6-supervise would restart it in a tight loop forever. Exiting 125
+# tells s6-supervise "permanently failed, do not restart" — the slot reports
+# down, which matches reality.
+#
+# When the proxy IS enabled and the run script later dies, we want the
+# restart, so exit non-125 in that case.
+#
+# Args to a finish script: $1=run-exit-code, $2=signal-num,
+# $3=service-dir-name, $4=run-pgid. See servicedir(7).
+
+case "${CLAUDE_PROXY_ENABLED:-1}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        exit 0
+        ;;
+    *)
+        exit 125
+        ;;
+esac

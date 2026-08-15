@@ -38,6 +38,28 @@ services:
       # Leave empty to log in manually inside the container instead.
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
 
+      # --- claude-proxy (only in the image built from ./Dockerfile) ----------
+      # An s6 service running claude_proxy/server.py inside THIS container, so
+      # hermes reaches it at http://127.0.0.1:8082 with no second container.
+      # It is absent from the published nousresearch image; these variables are
+      # simply ignored there. Build with: ./setup.sh --with-claude-code
+      - CLAUDE_PROXY_ENABLED=${CLAUDE_PROXY_ENABLED:-1}
+      - CLAUDE_PROXY_PORT=${CLAUDE_PROXY_PORT:-8082}
+      # LEAVE BOTH EMPTY. Empty means the `claude` CLI talks to
+      # api.anthropic.com with the subscription login stored in
+      # /opt/data/.claude — which is the entire reason this proxy exists.
+      #
+      # Setting them routes the CLI through a gateway instead, and that breaks
+      # Claude models on any router that namespaces them: the CLI resolves
+      # `--model sonnet` to `claude-sonnet-5`, a name a router serving
+      # `cc/claude-sonnet-5` does not have, so every call 404s. Only set these
+      # for a gateway that accepts plain Anthropic model names.
+      #
+      # Never point them at the proxy's own port — the run script clears
+      # ANTHROPIC_BASE_URL precisely to stop that loop.
+      - CLAUDE_PROXY_UPSTREAM_URL=${CLAUDE_PROXY_UPSTREAM_URL:-}
+      - CLAUDE_PROXY_UPSTREAM_TOKEN=${CLAUDE_PROXY_UPSTREAM_TOKEN:-}
+
       # --- Volume file ownership ---------------------------------------------
       # The runtime runs as UID 10000. If the host data directory belongs to a
       # different user (common on NAS boxes and bind mounts), set these to that
@@ -102,9 +124,17 @@ services:
     #   start_period: 60s
 
   # ---------------------------------------------------------------------------
-  # 9router — LLM router. Hermes reaches it by container name: http://9router:20128
+  # 9router — LLM router. Optional: hermes runs perfectly well without it, so it
+  # sits behind the `router` compose profile and stays down unless asked for.
+  #
+  #   docker compose --profile router up -d      # one-off
+  #   COMPOSE_PROFILES=router in .env            # every command, what setup.sh writes
+  #
+  # When it is running, hermes reaches it by container name at
+  # http://9router:20128 — no published port needed for that path.
   # ---------------------------------------------------------------------------
   9router:
+    profiles: [router]
     image: decolua/9router:latest
     container_name: 9router
     restart: unless-stopped
@@ -118,8 +148,14 @@ services:
     # A dedicated file, NOT the shared .env — that one holds hermes credentials
     # (dashboard password, CLAUDE_CODE_OAUTH_TOKEN) and env_file would load every
     # single one of them into this container.
+    #
+    # required: false because compose validates env_file for EVERY service at
+    # config time, profile or not. A hermes-only install never creates
+    # 9router.env, and without this flag even `docker compose ps` would fail on
+    # a file belonging to a service that is deliberately not running.
     env_file:
-      - 9router.env
+      - path: 9router.env
+        required: false
 
     # Overrides the values in 9router.env (compose prefers environment over env_file)
     environment:
@@ -141,7 +177,10 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  # Only 9router talks to headroom, so it shares the same profile — pulling in
+  # one without the other would leave 9router pointing at nothing.
   headroom:
+    profiles: [router]
     image: ghcr.io/chopratejas/headroom:latest
     container_name: headroom
     restart: unless-stopped
@@ -159,84 +198,6 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
-
-  # ---------------------------------------------------------------------------
-  # claude-cli-adapter — wraps the `claude` CLI in an Anthropic/OpenAI-style API.
-  # Source: github.com/0xphuong/claude-cli-adapter (separate repo; this file only
-  # runs the published image). To build from source, use that repo's compose file
-  # rather than adding a `build:` here — the build context is outside this
-  # directory.
-  # ---------------------------------------------------------------------------
-  claude-adapter:
-    image: docker.io/binhphuong/claude-cli-adapter:${ADAPTER_IMAGE_TAG:-latest}
-    container_name: claude-cli-adapter
-    restart: unless-stopped
-
-    ports:
-      # The adapter has NO auth of its own — it ignores the API key and serves
-      # anyone who can reach it. Hence a dedicated variable rather than the
-      # shared HERMES_BIND_ADDR: opening hermes to the LAN must not drag the
-      # adapter along. Only set it to 0.0.0.0 behind a reverse proxy that
-      # authenticates.
-      - "${ADAPTER_BIND_ADDR:-127.0.0.1}:${ADAPTER_PORT:-8082}:8082"
-
-    environment:
-      # The container-side names are ANTHROPIC_*, but they read from ADAPTER_*
-      # in .env — that file is shared with hermes, and bare names would collide
-      # with its own model configuration.
-      #
-      # Empty means unset: the adapter's entrypoint drops empty credential
-      # variables, so `${...:-}` here cannot break auth-method selection.
-
-      # Token mode: point the CLI at 9router over the internal network. The
-      # default is the container name, not a host IP — same network, direct hop.
-      - ANTHROPIC_BASE_URL=${ADAPTER_ANTHROPIC_BASE_URL:-http://9router:20128}
-      - ANTHROPIC_AUTH_TOKEN=${ADAPTER_ANTHROPIC_AUTH_TOKEN:-}
-      # Use INSTEAD OF ANTHROPIC_AUTH_TOKEN for endpoints expecting an x-api-key
-      # header. Setting both makes the entrypoint refuse to start.
-      - ANTHROPIC_API_KEY=${ADAPTER_ANTHROPIC_API_KEY:-}
-      # Subscription mode: clear the two variables above and set this instead.
-      - CLAUDE_CODE_OAUTH_TOKEN=${ADAPTER_CLAUDE_CODE_OAUTH_TOKEN:-}
-      # Model used when a client sends no "model" field. Behind 9router the model
-      # names are namespaced (e.g. cc/claude-sonnet-5); a plain Anthropic name 404s.
-      - ADAPTER_DEFAULT_MODEL=${ADAPTER_DEFAULT_MODEL:-}
-
-    volumes:
-      # The whole HOME, not just ~/.claude — Claude Code keeps state in BOTH
-      # ~/.claude/ (credentials, projects) and ~/.claude.json (config). Mounting
-      # only the directory loses the config file on every recreate.
-      #
-      # OWNERSHIP: this container runs as UID 10001 and has NO PUID/PGID like
-      # hermes — it starts directly as the `app` user and cannot chown anything.
-      # The host directory must be owned by 10001:10001 or Claude Code will not
-      # be able to write its credentials:
-      #   sudo chown -R 10001:10001 <directory>      (setup.sh does this for you)
-      - ${ADAPTER_DATA_DIR:-~/.claude-adapter}:/home/app
-
-    networks:
-      - hermes-net
-
-    depends_on:
-      - 9router
-
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-
-    # Every request spawns a `claude -p` Node process and the adapter imposes no
-    # concurrency limit — cap it here so a burst cannot exhaust the host.
-    deploy:
-      resources:
-        limits:
-          cpus: "${ADAPTER_CPU_LIMIT:-2.0}"
-          memory: ${ADAPTER_MEMORY_LIMIT:-2G}
-
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 networks:
   hermes-net:

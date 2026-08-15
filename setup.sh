@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# One-shot setup for the hermes-agent + 9router + headroom stack.
+# One-shot setup for hermes-agent. 9router + headroom are optional extras.
 # Idempotent: re-running never overwrites a secret that already exists.
 #
-#   ./setup.sh                     # set up + up -d
-#   ./setup.sh --with-claude-code  # build an image with the `claude` CLI from Dockerfile
+#   ./setup.sh                     # hermes only; asks whether to add 9router
+#   ./setup.sh --with-router       # hermes + 9router + headroom, no prompt
+#   ./setup.sh --without-router    # hermes only, no prompt
+#   ./setup.sh --with-claude-code  # build the image with the `claude` CLI + claude-proxy
 #   ./setup.sh --no-start          # only write the config files, do not start
-#   ./setup.sh --non-interactive   # prompt for nothing, generate the login passwords too
+#   ./setup.sh --non-interactive   # prompt for nothing (implies hermes only)
 #   ./setup.sh --help
 #
 set -euo pipefail
@@ -16,6 +18,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 WITH_CLAUDE_CODE=0
 NO_START=0
 NON_INTERACTIVE=0
+# empty = ask (or default to no when there is nothing to ask on)
+WITH_ROUTER=""
 
 # ---------------------------------------------------------------- output ----
 if [ -t 1 ]; then
@@ -31,7 +35,11 @@ warn() { printf '%s  !!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '%s error:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Prints the header comment block above: from the first line after `#!` +
+  # blank, up to the last comment line before `set -euo pipefail`. Derived
+  # rather than hardcoded, so adding an option to the block cannot silently
+  # drop the last line off `--help`.
+  awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
   exit 0
 }
 
@@ -39,6 +47,8 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-claude-code) WITH_CLAUDE_CODE=1 ;;
+    --with-router)      WITH_ROUTER=1 ;;
+    --without-router)   WITH_ROUTER=0 ;;
     --no-start)         NO_START=1 ;;
     --non-interactive)  NON_INTERACTIVE=1 ;;
     -h|--help)          usage ;;
@@ -156,8 +166,21 @@ command -v openssl >/dev/null 2>&1 || die "openssl is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 (the plugin) is required, not docker-compose v1"
 docker info >/dev/null 2>&1 || die "the docker daemon is not running"
 
+# The script has already cd'd next to itself, so "run it from the right
+# directory" is useless advice — moving your shell changes nothing. What
+# matters is WHICH COPY of setup.sh you run, so name the directory it is
+# actually looking in and point at the two ways out.
 for f in docker-compose.yml .env.example 9router.env.example; do
-  [ -f "$f" ] || die "missing $f — run this script from inside the repo directory"
+  [ -f "$f" ] && continue
+  printf '\n' >&2
+  warn "looked in: $PWD"
+  warn "setup.sh always works next to itself, so a lone copy of it cannot do anything."
+  warn "Either run the copy that sits beside docker-compose.yml:"
+  warn "    cd <install-dir> && ./setup.sh"
+  warn "or install from scratch:"
+  warn "    curl -fsSL https://raw.githubusercontent.com/0xphuong/hermes-agent/main/install.sh | bash"
+  printf '\n' >&2
+  die "missing $f"
 done
 ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null), compose $(docker compose version --short)"
 
@@ -196,97 +219,133 @@ if [ -z "$(get_kv HERMES_DASHBOARD_PASSWORD .env)" ]; then
   esac
   [ -n "$dash_pass" ] || die "empty dashboard password — run setup.sh again"
   set_kv .env HERMES_DASHBOARD_PASSWORD "$dash_pass"
-  [ "$DASH_PASS_PROMPTED" = 1 ] && ok "dashboard password set" \
-                               || ok "generated a dashboard password"
+  if [ "$DASH_PASS_PROMPTED" = 1 ]; then
+    ok "dashboard password set"
+  else
+    ok "generated a dashboard password"
+  fi
   printf '\n'
 else
   ok "HERMES_DASHBOARD_PASSWORD already set — leaving it alone"
   [ -n "$(get_kv HERMES_DASHBOARD_USER .env)" ] || set_kv .env HERMES_DASHBOARD_USER admin
 fi
 
-# ----------------------------------------------------------- 9router.env ----
-info "Preparing 9router.env"
-
-if [ ! -f 9router.env ]; then
-  cp 9router.env.example 9router.env
-  ok "created 9router.env from 9router.env.example"
-else
-  ok "9router.env already exists — keeping the current values"
+# ---------------------------------------------------------------- router ----
+# Hermes is the product; 9router is an optional LLM router in front of it, and
+# headroom is 9router's own dependency. Default is hermes alone.
+#
+# An existing install answers for itself: if 9router.env is already there the
+# router was chosen before, and a re-run must not quietly tear it down.
+if [ -z "$WITH_ROUTER" ]; then
+  if [ -f 9router.env ]; then
+    WITH_ROUTER=1
+    ok "9router.env exists — keeping 9router in this deployment"
+  elif [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
+    printf '\n  %sAlso install 9router?%s %s(LLM router + headroom; hermes does not need it)%s\n' \
+      "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    printf '    Install it? [y/N] '
+    IFS= read -r reply < /dev/tty || reply=""
+    case "$reply" in
+      [Yy]*) WITH_ROUTER=1 ;;
+      *)     WITH_ROUTER=0 ;;
+    esac
+    printf '\n'
+  else
+    WITH_ROUTER=0
+  fi
 fi
 
-# Internal secrets — generated.
-fill_secret 9router.env JWT_SECRET      && ok "generated JWT_SECRET"
-fill_secret 9router.env API_KEY_SECRET  && ok "generated API_KEY_SECRET"
-fill_secret 9router.env MACHINE_ID_SALT && ok "generated MACHINE_ID_SALT"
+# COMPOSE_PROFILES is read by the compose CLI itself out of ./.env, so every
+# later `docker compose …` in this directory picks the right services up
+# without anyone having to remember `--profile router`.
+if [ "$WITH_ROUTER" = 1 ]; then
+  set_kv .env COMPOSE_PROFILES router
+else
+  set_kv .env COMPOSE_PROFILES ""
+  ok "hermes only — 9router and headroom stay out of this deployment"
+fi
 
-# 9router login password — ask the user.
 ROUTER_PASS_PROMPTED=0
-if [ -z "$(get_kv INITIAL_PASSWORD 9router.env)" ]; then
-  printf '\n  %s9router login password%s\n' "$C_BOLD" "$C_RESET"
-  router_raw="$(prompt_password 'Password' 8)" \
-    || die "could not set a 9router password — run setup.sh again"
-  case "$router_raw" in
-    usr:*) router_pass="${router_raw#usr:}"; ROUTER_PASS_PROMPTED=1 ;;
-    gen:*) router_pass="${router_raw#gen:}"; ROUTER_PASS_PROMPTED=0 ;;
-    *)     die "prompt_password returned something unexpected — script bug" ;;
-  esac
-  [ -n "$router_pass" ] || die "empty 9router password — run setup.sh again"
-  set_kv 9router.env INITIAL_PASSWORD "$router_pass"
-  [ "$ROUTER_PASS_PROMPTED" = 1 ] && ok "9router password set" \
-                                 || ok "generated a 9router password"
-  printf '\n'
-else
-  ok "INITIAL_PASSWORD already set — leaving it alone"
+if [ "$WITH_ROUTER" = 1 ]; then
+  info "Preparing 9router.env"
+
+  if [ ! -f 9router.env ]; then
+    cp 9router.env.example 9router.env
+    ok "created 9router.env from 9router.env.example"
+  else
+    ok "9router.env already exists — keeping the current values"
+  fi
+
+  # Internal secrets — generated.
+  fill_secret 9router.env JWT_SECRET      && ok "generated JWT_SECRET"
+  fill_secret 9router.env API_KEY_SECRET  && ok "generated API_KEY_SECRET"
+  fill_secret 9router.env MACHINE_ID_SALT && ok "generated MACHINE_ID_SALT"
+
+  # 9router login password — ask the user.
+  if [ -z "$(get_kv INITIAL_PASSWORD 9router.env)" ]; then
+    printf '\n  %s9router login password%s\n' "$C_BOLD" "$C_RESET"
+    router_raw="$(prompt_password 'Password' 8)" \
+      || die "could not set a 9router password — run setup.sh again"
+    case "$router_raw" in
+      usr:*) router_pass="${router_raw#usr:}"; ROUTER_PASS_PROMPTED=1 ;;
+      gen:*) router_pass="${router_raw#gen:}"; ROUTER_PASS_PROMPTED=0 ;;
+      *)     die "prompt_password returned something unexpected — script bug" ;;
+    esac
+    [ -n "$router_pass" ] || die "empty 9router password — run setup.sh again"
+    set_kv 9router.env INITIAL_PASSWORD "$router_pass"
+    if [ "$ROUTER_PASS_PROMPTED" = 1 ]; then
+      ok "9router password set"
+    else
+      ok "generated a 9router password"
+    fi
+    printf '\n'
+  else
+    ok "INITIAL_PASSWORD already set — leaving it alone"
+  fi
 fi
 
-chmod 600 .env 9router.env 2>/dev/null || true
+chmod 600 .env 2>/dev/null || true
+[ -f 9router.env ] && chmod 600 9router.env 2>/dev/null || true
 
 # ------------------------------------------------------------- data dirs ----
 info "Creating the data directories"
 
 HERMES_DATA_DIR="$(expand_tilde "$(get_kv HERMES_DATA_DIR .env)")"
 ROUTER_DATA_DIR="$(expand_tilde "$(get_kv ROUTER_DATA_DIR .env)")"
-ADAPTER_DATA_DIR="$(expand_tilde "$(get_kv ADAPTER_DATA_DIR .env)")"
 : "${HERMES_DATA_DIR:=$HOME/.hermes}"
 : "${ROUTER_DATA_DIR:=$HOME/.9router}"
-: "${ADAPTER_DATA_DIR:=$HOME/.claude-adapter}"
 
-mkdir -p "$HERMES_DATA_DIR" "$ROUTER_DATA_DIR" "$ADAPTER_DATA_DIR"
+mkdir -p "$HERMES_DATA_DIR"
 ok "$HERMES_DATA_DIR"
-ok "$ROUTER_DATA_DIR"
-ok "$ADAPTER_DATA_DIR"
-
-# The adapter container starts directly as the `app` user (UID 10001) and has NO
-# PUID/PGID like hermes, so it cannot chown anything itself. If the host directory
-# belongs to someone else, Claude Code cannot write its credentials and fails with
-# a very unhelpful permission error.
-# macOS: Docker Desktop maps bind-mount ownership, so chown is both useless and
-# likely to fail.
-if [ "$(uname -s)" = "Linux" ] && [ "$(stat -c '%u' "$ADAPTER_DATA_DIR")" != "10001" ]; then
-  if chown -R 10001:10001 "$ADAPTER_DATA_DIR" 2>/dev/null; then
-    ok "chown 10001:10001 $ADAPTER_DATA_DIR"
-  elif [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ] \
-       && sudo chown -R 10001:10001 "$ADAPTER_DATA_DIR" </dev/tty; then
-    ok "chown 10001:10001 $ADAPTER_DATA_DIR (via sudo)"
-  else
-    warn "$ADAPTER_DATA_DIR is not owned by UID 10001 — the adapter cannot store credentials"
-    warn "  run:  sudo chown -R 10001:10001 $ADAPTER_DATA_DIR"
-  fi
+if [ "$WITH_ROUTER" = 1 ]; then
+  mkdir -p "$ROUTER_DATA_DIR"
+  ok "$ROUTER_DATA_DIR"
 fi
+
+# claude-proxy needs no directory of its own: it runs inside the hermes
+# container and the `claude` CLI stores its login and session transcripts under
+# /opt/data, which is $HERMES_DATA_DIR on the host. PUID/PGID already cover the
+# ownership.
 
 # ----------------------------------------------------- claude-code build ----
 OVERRIDE_FILE=docker-compose.override.yml
 
 if [ "$WITH_CLAUDE_CODE" = 1 ]; then
   [ -f Dockerfile ] || die "--with-claude-code needs the Dockerfile"
+  # HERMES_IMAGE_TAG is forwarded as a build arg, not just used for `image:`.
+  # Without it the derived image would always build FROM :latest while compose
+  # believes it is running the pinned tag — the two silently diverge.
   cat > "$OVERRIDE_FILE" <<'YAML'
 # Generated by setup.sh --with-claude-code. This file is git-ignored.
 services:
   hermes:
-    build: .
-    image: hermes-claude:latest
+    build:
+      context: .
+      args:
+        HERMES_IMAGE_TAG: ${HERMES_IMAGE_TAG:-latest}
+    image: hermes-claude:${HERMES_IMAGE_TAG:-latest}
 YAML
-  ok "created $OVERRIDE_FILE — hermes will build from Dockerfile (with the claude CLI)"
+  ok "created $OVERRIDE_FILE — hermes will build from Dockerfile (claude CLI + claude-proxy)"
 elif [ -f "$OVERRIDE_FILE" ] && grep -q 'setup.sh --with-claude-code' "$OVERRIDE_FILE" 2>/dev/null; then
   ok "$OVERRIDE_FILE already exists — still building the image with the claude CLI"
 fi
@@ -304,20 +363,133 @@ fi
 # --------------------------------------------------------- hermes wizard ----
 # The wizard asks for model API keys and chat-platform tokens and writes them to
 # $HERMES_DATA_DIR/.env. It only needs to run once.
+# Everything interactive goes through /dev/tty rather than stdin. Under
+# `curl … | bash` stdin IS the script being piped in, so a plain `read` there
+# consumes the rest of the script instead of the user's answer, and `[ -t 0 ]`
+# is false even when a perfectly good terminal is attached.
 if [ ! -f "$HERMES_DATA_DIR/.env" ]; then
-  if [ -t 0 ] && [ -t 1 ]; then
+  if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
     info "No $HERMES_DATA_DIR/.env yet — the hermes setup wizard needs to run"
     printf '    Run the wizard now? [Y/n] '
-    read -r reply
+    IFS= read -r reply < /dev/tty || reply=""
     case "${reply:-Y}" in
       [Nn]*) warn "skipped — the gateway will have no API key; run it later with:"
              warn "  docker run -it --rm -v $HERMES_DATA_DIR:/opt/data nousresearch/hermes-agent setup" ;;
-      *)     docker run -it --rm -v "$HERMES_DATA_DIR:/opt/data" nousresearch/hermes-agent setup ;;
+      # The wizard is interactive, so hand docker the terminal explicitly: with
+      # a piped stdin `-it` would fail with "the input device is not a TTY".
+      *)     docker run -it --rm -v "$HERMES_DATA_DIR:/opt/data" \
+               nousresearch/hermes-agent setup < /dev/tty ;;
     esac
   else
-    warn "no $HERMES_DATA_DIR/.env and no TTY to run the wizard on"
+    warn "no $HERMES_DATA_DIR/.env and no terminal to run the wizard on"
     warn "run it by hand:  docker run -it --rm -v $HERMES_DATA_DIR:/opt/data nousresearch/hermes-agent setup"
   fi
+fi
+
+# ------------------------------------------------- wire hermes -> proxy ----
+# Point hermes' model config at the in-container claude-proxy. Only meaningful
+# for the image that actually carries the proxy, and only after the wizard has
+# produced a config.yaml to patch.
+#
+# Idempotent like the rest of this script: it writes only when the model block
+# is missing or already aimed at the proxy. A model block pointing anywhere
+# else is a deliberate choice, so it is reported and left alone.
+CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-sonnet-4-6}"
+CLAUDE_PROXY_KEY_ENV=HERMES_CLAUDE_PROXY_API_KEY
+
+wire_claude_proxy() {
+  local cfg="$HERMES_DATA_DIR/config.yaml" tmp cur block entry
+  [ -f "$cfg" ] || { warn "no $cfg yet — run the wizard, then re-run setup.sh"; return 0; }
+
+  # base_url of the current model block, empty when there is no block.
+  cur="$(awk '
+    /^model:/            { inblk = 1; next }
+    inblk && /^[^ \t#]/  { inblk = 0 }
+    inblk && $1 == "base_url:" { print $2; exit }
+  ' "$cfg")"
+
+  case "$cur" in
+    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*) ;;
+    *)
+      warn "model.base_url is already $cur — leaving config.yaml alone"
+      warn "  to use the proxy instead, set it to http://localhost:$ADAPTER_PROXY_PORT/v1"
+      return 0
+      ;;
+  esac
+
+  cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M%S)"
+
+  # `provider: local` names an entry in custom_providers — the pair has to
+  # agree, so both are written together. api_mode MUST be anthropic_messages:
+  # the proxy serves /v1/messages only, and chat_completions 404s every call.
+  block="model:
+  default: $CLAUDE_PROXY_MODEL
+  provider: local
+  base_url: http://localhost:$ADAPTER_PROXY_PORT/v1
+  api_key: \${$CLAUDE_PROXY_KEY_ENV}
+  api_mode: anthropic_messages"
+
+  entry="  - name: local
+    base_url: http://localhost:$ADAPTER_PROXY_PORT/v1
+    key_env: $CLAUDE_PROXY_KEY_ENV
+    model: $CLAUDE_PROXY_MODEL
+    api_mode: anthropic_messages"
+
+  # The blocks go through files, never `awk -v`: a -v assignment cannot hold a
+  # newline. BSD awk rejects it outright ("newline in string") and the edit is
+  # silently skipped, which is worse than a hard failure — the script would go
+  # on to report success over an unmodified config.
+  local blkfile entfile
+  blkfile="$(mktemp)"; printf '%s\n' "$block" > "$blkfile"
+  entfile="$(mktemp)"; printf '%s\n' "$entry" > "$entfile"
+
+  # Replace the whole model block, leaving every other byte of the file — and
+  # its comments — untouched. Appends the block when the file has none.
+  tmp="$(mktemp)"
+  awk -v blkfile="$blkfile" '
+    BEGIN                { while ((getline l < blkfile) > 0) blk = blk l "\n"
+                           sub(/\n$/, "", blk) }
+    /^model:/            { print blk; inblk = 1; seen = 1; next }
+    inblk && /^[ \t]/    { next }
+    inblk                { inblk = 0 }
+                         { print }
+    END                  { if (!seen) print blk }
+  ' "$cfg" > "$tmp" || die "failed to patch the model block in $cfg"
+  mv "$tmp" "$cfg"
+
+  if grep -qE '^[[:space:]]+- name: local[[:space:]]*$' "$cfg"; then
+    ok "custom_providers already has 'local' — kept as is"
+  else
+    tmp="$(mktemp)"
+    awk -v entfile="$entfile" '
+      BEGIN                { while ((getline l < entfile) > 0) e = e l "\n"
+                             sub(/\n$/, "", e) }
+      /^custom_providers:/ { print; print e; seen = 1; next }
+                           { print }
+      END                  { if (!seen) { print "custom_providers:"; print e } }
+    ' "$cfg" > "$tmp" || die "failed to add the custom_providers entry in $cfg"
+    mv "$tmp" "$cfg"
+    ok "added custom_providers entry 'local'"
+  fi
+  rm -f "$blkfile" "$entfile"
+
+  grep -q '^model:' "$cfg" || die "model block missing from $cfg after patching — restore the .bak file"
+
+  # The proxy ignores the key entirely, but hermes refuses to start a provider
+  # whose key_env resolves to nothing.
+  if [ -f "$HERMES_DATA_DIR/.env" ] \
+     && [ -z "$(get_kv "$CLAUDE_PROXY_KEY_ENV" "$HERMES_DATA_DIR/.env")" ]; then
+    set_kv "$HERMES_DATA_DIR/.env" "$CLAUDE_PROXY_KEY_ENV" dummy
+    ok "set $CLAUDE_PROXY_KEY_ENV=dummy in $HERMES_DATA_DIR/.env (the proxy ignores it)"
+  fi
+
+  ok "model -> http://localhost:$ADAPTER_PROXY_PORT/v1 ($CLAUDE_PROXY_MODEL)"
+}
+
+if [ "$WITH_CLAUDE_CODE" = 1 ]; then
+  ADAPTER_PROXY_PORT="$(get_kv CLAUDE_PROXY_PORT .env)"; : "${ADAPTER_PROXY_PORT:=8082}"
+  info "Wiring hermes to claude-proxy"
+  wire_claude_proxy
 fi
 
 # ----------------------------------------------------------------- start ----
@@ -341,8 +513,6 @@ BIND_ADDR="$(get_kv HERMES_BIND_ADDR .env)";        : "${BIND_ADDR:=127.0.0.1}"
 DASH_PORT="$(get_kv HERMES_DASHBOARD_PORT .env)";   : "${DASH_PORT:=9119}"
 API_PORT="$(get_kv HERMES_API_PORT .env)";          : "${API_PORT:=8642}"
 ROUTER_PORT="$(get_kv ROUTER_PORT .env)";           : "${ROUTER_PORT:=20128}"
-ADAPTER_PORT="$(get_kv ADAPTER_PORT .env)";         : "${ADAPTER_PORT:=8082}"
-ADAPTER_ADDR="$(get_kv ADAPTER_BIND_ADDR .env)";    : "${ADAPTER_ADDR:=127.0.0.1}"
 DASH_USER="$(get_kv HERMES_DASHBOARD_USER .env)"
 DASH_PASS="$(get_kv HERMES_DASHBOARD_PASSWORD .env)"
 ROUTER_PASS="$(get_kv INITIAL_PASSWORD 9router.env)"
@@ -357,11 +527,16 @@ printf '%s========================================================%s\n\n' "$C_BO
 
 printf '%sAccess%s\n' "$C_BOLD" "$C_RESET"
 printf '  Hermes dashboard   http://%s:%s\n' "$BIND_ADDR" "$DASH_PORT"
-printf '  9router            http://%s:%s\n' "$BIND_ADDR" "$ROUTER_PORT"
+if [ "$WITH_ROUTER" = 1 ]; then
+  printf '  9router            http://%s:%s\n' "$BIND_ADDR" "$ROUTER_PORT"
+fi
 printf '  Hermes API         http://%s:%s  %s(only with API_SERVER_ENABLED)%s\n' \
   "$BIND_ADDR" "$API_PORT" "$C_DIM" "$C_RESET"
-printf '  claude-adapter     http://%s:%s  %s(NO auth — do not expose)%s\n\n' \
-  "$ADAPTER_ADDR" "$ADAPTER_PORT" "$C_DIM" "$C_RESET"
+if [ "$WITH_CLAUDE_CODE" = 1 ]; then
+  printf '  claude-proxy       %sinside the hermes container only, http://localhost:8082%s\n' \
+    "$C_DIM" "$C_RESET"
+fi
+printf '\n'
 
 printf '%sCredentials%s\n' "$C_BOLD" "$C_RESET"
 if [ "$DASH_PASS_PROMPTED" = 1 ]; then
@@ -369,35 +544,57 @@ if [ "$DASH_PASS_PROMPTED" = 1 ]; then
 else
   printf '  Dashboard  %s / %s\n' "$DASH_USER" "$DASH_PASS"
 fi
-if [ "$ROUTER_PASS_PROMPTED" = 1 ]; then
-  printf '  9router    %s(the password you just typed)%s\n' "$C_DIM" "$C_RESET"
+if [ "$WITH_ROUTER" = 1 ]; then
+  if [ "$ROUTER_PASS_PROMPTED" = 1 ]; then
+    printf '  9router    %s(the password you just typed)%s\n' "$C_DIM" "$C_RESET"
+  else
+    printf '  9router    password: %s\n' "$ROUTER_PASS"
+  fi
+  printf '  %sForgot them? grep PASSWORD .env 9router.env%s\n\n' "$C_DIM" "$C_RESET"
 else
-  printf '  9router    password: %s\n' "$ROUTER_PASS"
+  printf '  %sForgot it? grep PASSWORD .env%s\n\n' "$C_DIM" "$C_RESET"
 fi
-printf '  %sForgot them? grep PASSWORD .env 9router.env%s\n\n' "$C_DIM" "$C_RESET"
 
 if [ "$BIND_ADDR" = "127.0.0.1" ]; then
   printf '%sReaching it from another machine%s\n' "$C_BOLD" "$C_RESET"
   printf '  The ports are bound to loopback. Use an SSH tunnel:\n'
-  printf '    ssh -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s user@<host>\n' \
-    "$DASH_PORT" "$DASH_PORT" "$ROUTER_PORT" "$ROUTER_PORT"
+  if [ "$WITH_ROUTER" = 1 ]; then
+    printf '    ssh -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s user@<host>\n' \
+      "$DASH_PORT" "$DASH_PORT" "$ROUTER_PORT" "$ROUTER_PORT"
+  else
+    printf '    ssh -L %s:127.0.0.1:%s user@<host>\n' "$DASH_PORT" "$DASH_PORT"
+  fi
   printf '  %sSet HERMES_BIND_ADDR=0.0.0.0 in .env to expose it — read the README first.%s\n\n' \
     "$C_DIM" "$C_RESET"
 fi
 
 printf '%sData%s\n' "$C_BOLD" "$C_RESET"
 printf '  Hermes          %s\n' "$HERMES_DATA_DIR"
-printf '  9router         %s\n' "$ROUTER_DATA_DIR"
-printf '  claude-adapter  %s\n\n' "$ADAPTER_DATA_DIR"
+if [ "$WITH_ROUTER" = 1 ]; then
+  printf '  9router         %s\n' "$ROUTER_DATA_DIR"
+fi
+printf '\n'
 
-printf '%sWiring hermes to 9router%s\n' "$C_BOLD" "$C_RESET"
-printf '  Edit %s/config.yaml:\n' "$HERMES_DATA_DIR"
-printf '    model:\n'
-printf '      provider: custom\n'
-printf '      model: <model-name-on-9router>\n'
-printf '      base_url: http://9router:20128/v1\n'
-printf '      api_key: "none"\n'
-printf '  Then: docker compose restart hermes\n\n'
+if [ "$WITH_CLAUDE_CODE" = 1 ]; then
+  printf '%sModel wiring%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %s/config.yaml already points at claude-proxy.\n' "$HERMES_DATA_DIR"
+  printf '  Log the claude CLI in once, then it is ready:\n'
+  printf '    docker exec -it -u hermes hermes claude\n'
+  printf '  Check:  docker exec -u hermes hermes hermes chat -q "say PONG"\n\n'
+elif [ "$WITH_ROUTER" = 1 ]; then
+  printf '%sWiring hermes to 9router%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Edit %s/config.yaml:\n' "$HERMES_DATA_DIR"
+  printf '    model:\n'
+  printf '      provider: custom\n'
+  printf '      model: <model-name-on-9router>\n'
+  printf '      base_url: http://9router:20128/v1\n'
+  printf '      api_key: "none"\n'
+  printf '  Then: docker compose restart hermes\n\n'
+else
+  printf '%sNext: pick a model%s\n' "$C_BOLD" "$C_RESET"
+  printf '  The wizard wrote your provider keys to %s/.env.\n' "$HERMES_DATA_DIR"
+  printf '  Add 9router later with:  ./setup.sh --with-router\n\n'
+fi
 
 printf '%sCommon commands%s\n' "$C_BOLD" "$C_RESET"
 printf '  docker compose logs -f              # live logs\n'

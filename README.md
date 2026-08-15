@@ -11,20 +11,51 @@ new image; nothing is lost.
 ## Quick install
 
 ```bash
-git clone git@github-0xphuong:0xphuong/hermes-agent.git
-cd hermes-agent
-./setup.sh
+curl -fsSL https://raw.githubusercontent.com/0xphuong/hermes-agent/main/install.sh | bash
 ```
 
-The script creates the data directories, runs the hermes setup wizard, does `docker compose up -d`,
-then prints the URLs and access details. It is safe to re-run — existing values are never
-overwritten.
+Add flags after `--`:
 
-**Internal secrets** (`HERMES_DASHBOARD_SECRET`, `JWT_SECRET`, `API_KEY_SECRET`, `MACHINE_ID_SALT`)
-are generated automatically, with no prompt.
+```bash
+curl -fsSL .../install.sh | bash -s -- --with-claude-code
+```
 
-**Login passwords** — dashboard and 9router — are prompted for (typed twice, not echoed). Press
-Enter to skip and get a random string instead.
+The installer clones the repo into a temporary directory, copies out only the files the running
+stack needs, deletes the clone, and hands over to `setup.sh`. What is left in `~/hermes-agent` is
+the deployment — no `.git`, no docs, no installer:
+
+```
+docker-compose.yml  Dockerfile  .dockerignore  docker/  setup.sh
+.env  .env.example  9router.env.example
+```
+
+`setup.sh` stays so you can re-run it later. Point the install somewhere else with
+`INSTALL_DIR=/opt/hermes-agent`, and pin the version with `HERMES_AGENT_REF=v1.2.3`.
+
+> Piping a script from the internet into a shell runs it before you have read it. To look first:
+> `curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh`
+
+**Hermes alone is the default.** 9router (an LLM router) and headroom are optional extras; setup
+asks once whether you want them, and the answer is No unless you say otherwise. Skip the question
+with `--with-router` / `--without-router`.
+
+setup.sh creates the data directories, runs the hermes setup wizard, does `docker compose up -d`,
+then prints the URLs and access details. Both scripts are safe to re-run — `.env` and `9router.env`
+are never copied over or regenerated, so existing secrets survive, and an install that already has
+9router keeps it.
+
+Prefer to keep the repo? The old flow still works:
+
+```bash
+git clone git@github-0xphuong:0xphuong/hermes-agent.git
+cd hermes-agent && ./setup.sh
+```
+
+**Internal secrets** (`HERMES_DASHBOARD_SECRET`, and `JWT_SECRET` / `API_KEY_SECRET` /
+`MACHINE_ID_SALT` when 9router is installed) are generated automatically, with no prompt.
+
+**Login passwords** — the dashboard, plus 9router if you install it — are prompted for (typed twice,
+not echoed). Press Enter to skip and get a random string instead.
 
 > Passwords must not contain `$`. Docker Compose reads it as a variable and swallows the rest —
 > `ab$cde` arrives in the container as `ab`, with no error anywhere. The script rejects it at the
@@ -32,10 +63,31 @@ Enter to skip and get a random string instead.
 
 | Option | Effect |
 |---|---|
-| `--with-claude-code` | Build the image from `Dockerfile` (bundles the `claude` CLI) instead of using the official one |
+| `--with-router` | Install 9router + headroom too, no prompt |
+| `--without-router` | Hermes only, no prompt |
+| `--with-claude-code` | Build the image from `Dockerfile` — the `claude` CLI plus the supervised claude-proxy service — instead of using the official one |
 | `--no-start` | Only write the config files, do not start anything |
-| `--non-interactive` | Prompt for nothing, generate the login passwords too (for CI) |
+| `--non-interactive` | Prompt for nothing (implies hermes only) |
 | `--help` | Show usage |
+
+### Adding or removing 9router later
+
+The two extra services sit behind a compose **profile**, selected by `COMPOSE_PROFILES` in `.env`:
+
+```bash
+./setup.sh --with-router     # writes COMPOSE_PROFILES=router, generates its secrets
+docker compose up -d
+
+# and to drop them again
+docker compose --profile router down   # stop what is running first
+sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/' .env
+```
+
+`COMPOSE_PROFILES` is read by the compose CLI itself, so a plain `docker compose up -d` in that
+directory always acts on the right set of services — no `--profile` to remember. A hermes-only
+install never creates `9router.env`, which is why the compose file marks that `env_file` as
+`required: false`: without it, even `docker compose ps` would fail over a file belonging to a
+service that is deliberately not running.
 
 The rest of this document describes the manual steps the script performs for you.
 
@@ -93,8 +145,8 @@ docker compose logs -f
 |---|---|---|
 | Dashboard | `http://127.0.0.1:9119` | Log in with `HERMES_DASHBOARD_USER` / `_PASSWORD` |
 | API (OpenAI-compatible) | `http://127.0.0.1:8642` | Only works once `API_SERVER_*` is enabled |
-| 9router | `http://127.0.0.1:20128` | Router UI; on the internal network it is `http://9router:20128` |
-| claude-cli-adapter | `http://127.0.0.1:8082` | **No auth** — see the section below |
+| 9router | `http://127.0.0.1:20128` | Only with `COMPOSE_PROFILES=router`; internally `http://9router:20128` |
+| claude-proxy | `http://localhost:8082` | **Inside the hermes container only**, never published |
 
 Everything **binds to host loopback by default**. Reach the dashboard from another machine over an
 SSH tunnel:
@@ -206,11 +258,13 @@ All state lives in bind-mounted directories; there are no named volumes:
 
 ```bash
 docker compose stop
-tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes .9router .claude-adapter
+tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes           # hermes only
+tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes .9router  # with 9router
 docker compose start
 ```
 
-After restoring, put the ownership back: `sudo chown -R 10001:10001 ~/.claude-adapter`.
+The `claude` CLI's login and session transcripts are inside `.hermes` (the container's
+`/opt/data`), so they come back with it.
 
 ---
 
@@ -249,79 +303,104 @@ trailing `/` on `base_url`. `model` must match `--served-model-name`.
 
 Check it: `docker exec hermes curl -s http://vllm:8000/v1/models`
 
-### claude-cli-adapter
+### claude-proxy — running the `claude` CLI inside the hermes container
 
-The `claude-cli-adapter` container wraps the `claude` CLI in an **Anthropic Messages API** — it serves
-`POST /v1/messages`, `GET /v1/models` and `GET /health`, and nothing else. There is no
-`/v1/chat/completions`, so it goes in the **anthropic** provider block, not `provider: custom`
-(which expects an OpenAI-shaped endpoint).
+Built from `./Dockerfile` (`./setup.sh --with-claude-code`), which adds three things to the published
+hermes image: the `claude` CLI, `claude_proxy/server.py` fetched from
+[`0xphuong/claude-cli-adapter`](https://github.com/0xphuong/claude-cli-adapter), and an s6 service
+that supervises it. The proxy wraps the local CLI in an **Anthropic Messages API** — `POST
+/v1/messages`, `GET /v1/models`, `GET /health`, and nothing else.
 
-It sits on the same `hermes-net` network, so Hermes reaches it by container name:
+It listens on `127.0.0.1:8082` **inside the hermes container**, so hermes reaches it with no network
+hop and nothing published to the host.
+
+`./setup.sh --with-claude-code` writes this wiring into `~/.hermes/config.yaml` for you:
 
 ```yaml
-providers:
-  anthropic:
-    base_url: http://claude-cli-adapter:8082   # no /v1 suffix — the SDK appends it
-    api_key: dummy                             # required by the SDK, ignored by the adapter
-    model: cc/claude-sonnet-5
+model:
+  default: claude-sonnet-4-6
+  provider: local
+  base_url: http://localhost:8082/v1
+  api_key: ${HERMES_CLAUDE_PROXY_API_KEY}   # required by the client, ignored by the proxy
+  api_mode: anthropic_messages              # NOT chat_completions
+
+custom_providers:
+  - name: local                             # must match model.provider
+    base_url: http://localhost:8082/v1
+    key_env: HERMES_CLAUDE_PROXY_API_KEY
+    model: claude-sonnet-4-6
+    api_mode: anthropic_messages
 ```
 
-Use port **8082** here, not `ADAPTER_PORT` — that one only maps the published host port. Inside the
-network the container always listens on 8082.
+Two things that are easy to get wrong:
 
-The adapter's default backend is 9router (`http://9router:20128`), which needs
-`ADAPTER_ANTHROPIC_AUTH_TOKEN` in `.env` — an API key generated in the 9router UI. To use a
-subscription instead of a token, clear that value and set `ADAPTER_CLAUDE_CODE_OAUTH_TOKEN`
-(generated with `claude setup-token`). Setting `ADAPTER_ANTHROPIC_AUTH_TOKEN` and
-`ADAPTER_ANTHROPIC_API_KEY` at the same time makes the container **refuse to start** — the CLI would
-send two auth headers.
+- `api_mode` **must** be `anthropic_messages`. The proxy serves `/v1/messages` only, so
+  `chat_completions` 404s every single call.
+- `provider: local` names an entry in `custom_providers`; the two have to agree. `provider: anthropic`
+  will not work here — hermes ignores `model.base_url` for it and goes straight to api.anthropic.com.
 
-> The adapter has **no authentication of its own**: it ignores the API key and serves anyone who can
-> reach it. That is why `ADAPTER_BIND_ADDR` is a separate variable, deliberately decoupled from
-> `HERMES_BIND_ADDR` — opening the dashboard to the LAN must not drag the adapter along. Only set it
-> to `0.0.0.0` behind a reverse proxy that authenticates.
+Like the rest of `setup.sh`, this is idempotent and never overwrites a deliberate choice: if
+`model.base_url` already points somewhere other than the proxy, it is reported and left alone. It
+also backs up `config.yaml` before writing, and sets `HERMES_CLAUDE_PROXY_API_KEY=dummy` in
+`~/.hermes/.env` because hermes refuses to start a provider whose `key_env` resolves to nothing.
 
-The `claude` CLI's state (credentials + `.claude.json`) lives in `ADAPTER_DATA_DIR`, default
-`~/.claude-adapter`, mounted at `/home/app`. The container runs as **UID 10001** and has **no
-`PUID`/`PGID`** like hermes does — it starts directly as the `app` user, so it cannot chown anything
-itself. On Linux that directory must be owned by `10001:10001`:
+Override the model with `CLAUDE_PROXY_MODEL=... ./setup.sh --with-claude-code`. Verify a name before
+wiring it in — `claude --model <id>` accepts `sonnet`, `opus`, `claude-sonnet-4-6` and other aliases,
+but not every string that looks valid.
+
+The `claude` CLI it drives uses the subscription login stored at `/opt/data/.claude`. Log in once:
 
 ```bash
-sudo chown -R 10001:10001 ~/.claude-adapter
+docker exec -it -u hermes hermes claude
 ```
 
-`setup.sh` handles this (asking for sudo if needed). Skip it and Claude Code cannot write its
-credentials, failing with a very unhelpful permission error. On macOS, Docker Desktop maps ownership
-for you and this is unnecessary.
+That path is on the `/opt/data` volume, so the login and the CLI's session transcripts survive
+container recreates — and the proxy's `--resume` needs both.
 
-Source lives in its own repo,
-[`0xphuong/claude-cli-adapter`](https://github.com/0xphuong/claude-cli-adapter); this compose file
-only runs the published image. To build from source, use the compose file in that repo.
+> **Do not set `CLAUDE_PROXY_UPSTREAM_URL` / `_TOKEN` to a namespacing router.** They point the CLI
+> at a gateway instead of api.anthropic.com. The CLI expands `--model sonnet` into
+> `claude-sonnet-5`; a router that serves `cc/claude-sonnet-5` does not have that name, so every
+> call 404s and it reads as a broken proxy. Leave both empty for the subscription.
 
-#### Smoke-testing the adapter
+Service controls, all inside the container:
 
 ```bash
-# 1. Liveness, from the host
-curl -s http://127.0.0.1:8082/health
+docker exec hermes /command/s6-svstat /run/service/claude-proxy   # up/down + uptime
+docker exec hermes curl -s http://127.0.0.1:8082/health
+docker compose logs -f hermes | grep -i proxy                     # it logs to stdout
+```
 
-# 2. Model list (a hardcoded stub — it does NOT reflect ADAPTER_DEFAULT_MODEL)
-curl -s http://127.0.0.1:8082/v1/models
+Set `CLAUDE_PROXY_ENABLED=0` to leave the slot supervised but down.
 
-# 3. A real completion. Every request spawns a fresh `claude -p`, so expect
-#    tens of seconds, not milliseconds.
-curl -s -X POST http://127.0.0.1:8082/v1/messages \
+#### Smoke-testing the proxy
+
+Everything runs inside the hermes container, so every command goes through `docker exec`:
+
+```bash
+# 1. Liveness
+docker exec hermes curl -s http://127.0.0.1:8082/health
+
+# 2. Model list (a hardcoded stub — it does not reflect what the CLI can reach)
+docker exec hermes curl -s http://127.0.0.1:8082/v1/models
+
+# 3. A real completion. The first call for a given system+tools fingerprint
+#    bootstraps a claude session and pays full price; later calls reuse it and
+#    read from cache. Expect tens of seconds either way, not milliseconds.
+docker exec hermes curl -s -X POST http://127.0.0.1:8082/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: dummy' \
-  -d '{"model":"cc/claude-sonnet-5","max_tokens":64,
+  -d '{"model":"claude-sonnet-4-6","max_tokens":64,
        "messages":[{"role":"user","content":"Reply with exactly: PONG"}]}'
-
-# 4. The path Hermes actually takes — by container name, over hermes-net
-docker exec hermes curl -s http://claude-cli-adapter:8082/health
 ```
 
-If step 3 fails but step 1 works, the problem is the backend rather than the adapter: check
-`docker compose logs claude-adapter` and confirm `ADAPTER_ANTHROPIC_AUTH_TOKEN` is a key 9router
-recognises and that the model name exists there.
+If step 3 fails while step 1 works, the problem is the CLI rather than the proxy. Run it directly to
+see the real error, which the proxy only forwards as an opaque 502:
+
+```bash
+docker exec -u hermes hermes claude -p "hi" --output-format json
+```
+
+A 404 on every model usually means `CLAUDE_PROXY_UPSTREAM_URL` is pointing the CLI at a router that
+namespaces its models. Empty is the right value for the subscription.
 
 ---
 

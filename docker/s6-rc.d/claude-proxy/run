@@ -1,0 +1,88 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# claude-proxy service — runs claude_proxy/server.py inside the hermes
+# container, so hermes reaches it at 127.0.0.1 with no second container and
+# no network hop. Modelled on the dashboard service: always declared so s6
+# has a supervised slot, and the companion finish script returns 125 when the
+# service is switched off, which s6 reads as "permanent failure, don't
+# restart" and reports the slot as down.
+
+case "${CLAUDE_PROXY_ENABLED:-1}" in
+    1|true|TRUE|True|yes|YES|Yes) ;;
+    *)
+        # Clean exit; ./finish turns it into a permanent-failure marker so
+        # s6-svstat reflects reality instead of a restart loop.
+        exit 0
+        ;;
+esac
+
+# with-contenv repopulates HOME from /init as /root. The claude CLI keeps its
+# credentials in $HOME/.claude/ AND its session transcripts under
+# $HOME/.claude/projects/ — the proxy's --resume needs both. Anchor HOME on
+# the /opt/data volume or every container recreate loses the login and forces
+# a full-price re-bootstrap of every profile.
+#
+# /opt/data, NOT /opt/data/home: `docker exec -it -u hermes hermes claude`
+# inherits the hermes user's own HOME (/opt/data, set by useradd -d in the
+# base image), so an interactive login lands in /opt/data/.claude. A service
+# reading a different HOME sees no credentials and every call fails as if
+# never logged in, which looks like an auth bug rather than a path mismatch.
+export HOME="${CLAUDE_PROXY_HOME:-/opt/data}"
+
+# LOOP GUARD — the reason this block exists at all.
+#
+# server.py spawns `claude` with asyncio.create_subprocess_exec and no env
+# argument, so the child inherits this service's environment verbatim. Hermes
+# is pointed at this proxy through ANTHROPIC_BASE_URL; if that value were
+# visible here, `claude` would call the proxy, which would spawn `claude`,
+# which would call the proxy — a fork bomb that looks like a hang.
+#
+# So: clear it unconditionally, and let CLAUDE_PROXY_UPSTREAM_URL name the
+# real upstream explicitly when the CLI should go somewhere other than
+# api.anthropic.com (a 9router instance, say).
+# All three go, not just the base URL: an ANTHROPIC_AUTH_TOKEN or
+# ANTHROPIC_API_KEY left in the container environment makes the CLI prefer
+# that credential over the stored subscription login, silently billing a
+# different bucket.
+unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY
+
+# DEFAULT: nothing exported → `claude` talks to api.anthropic.com with the
+# subscription login in $HOME/.claude. That is the point of this proxy.
+#
+# The two variables below only exist for the case where the CLI must go
+# through a gateway instead. Think hard before setting them: a router that
+# namespaces its models (`cc/claude-sonnet-5`) will 404 every plain
+# `claude-*` name the CLI resolves internally — `--model sonnet` becomes
+# `claude-sonnet-5`, which such a router does not have. Symptom is a 404 on
+# every call that looks like the proxy is broken.
+if [ -n "${CLAUDE_PROXY_UPSTREAM_URL:-}" ]; then
+    export ANTHROPIC_BASE_URL="${CLAUDE_PROXY_UPSTREAM_URL}"
+fi
+if [ -n "${CLAUDE_PROXY_UPSTREAM_TOKEN:-}" ]; then
+    export ANTHROPIC_AUTH_TOKEN="${CLAUDE_PROXY_UPSTREAM_TOKEN}"
+fi
+
+# npm's global prefix is /opt/claude in this image (see Dockerfile); the
+# symlink lands in /usr/local/bin, which is not guaranteed to be on the PATH
+# that with-contenv hands us.
+export PATH="/usr/local/bin:${PATH}"
+
+# `claude -p` inherits this working directory and walks up from it looking for
+# CLAUDE.md. s6 does not promise which directory a run script starts in, so pin
+# it to the empty one the Dockerfile creates: otherwise the model's context
+# quietly depends on where the supervisor happened to be.
+cd /workspace || exit 1
+
+# The proxy has NO authentication of its own. Loopback only — anything else
+# needs an authenticating reverse proxy in front, and this container has none.
+proxy_host="${CLAUDE_PROXY_HOST:-127.0.0.1}"
+proxy_port="${CLAUDE_PROXY_PORT:-8082}"
+
+# fastapi and uvicorn already ship in the hermes venv; no extra install.
+set -- /opt/hermes/.venv/bin/python /opt/hermes/claude_proxy/server.py \
+    --host "$proxy_host" --port "$proxy_port"
+
+# Skip the drop when already non-root (mirrors the dashboard service).
+[ "$(id -u)" = 0 ] || exec "$@"
+exec s6-setuidgid hermes "$@"
