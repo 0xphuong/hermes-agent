@@ -44,6 +44,15 @@ Pin the version with `HERMES_AGENT_REF=v1.2.3`, or keep the working directory fo
 > Piping a script from the internet into a shell runs it before you have read it. To look first:
 > `curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh`
 
+### Requirements
+
+Docker and the compose v2 plugin. The installer checks for them and, if either is missing on an
+**apt** system, offers to install Docker CE from the official repository, start it, and add you to
+the `docker` group. Everywhere else it says what is missing and stops rather than guessing.
+
+Group membership only takes effect in a new login session, so a first install on a machine without
+Docker ends by asking you to `newgrp docker` (or log out and back in) and run the installer again.
+
 **Hermes alone is the default.** 9router (an LLM router) and headroom are optional extras; setup
 asks once whether you want them, and the answer is No unless you say otherwise. Skip the question
 with `--with-router` / `--without-router`.
