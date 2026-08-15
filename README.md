@@ -20,17 +20,26 @@ Add flags after `--`:
 curl -fsSL .../install.sh | bash -s -- --with-claude-code
 ```
 
-The installer clones the repo into a temporary directory, copies out only the files the running
-stack needs, deletes the clone, and hands over to `setup.sh`. What is left in `~/hermes-agent` is
-the deployment — no `.git`, no docs, no installer:
+The installer clones into a temporary directory, runs `setup.sh` there, and deletes the clone.
+**Nothing is left on disk.** The containers keep running by themselves (`restart: unless-stopped`),
+and day-to-day you talk to them through the `hermes` alias setup offers to add:
 
-```
-docker-compose.yml  Dockerfile  .dockerignore  docker/  setup.sh
-.env  .env.example  9router.env.example
+```bash
+hermes                  # open the chat CLI
+hermes status           # gateway status
+hermes logs --follow    # live logs
 ```
 
-`setup.sh` stays so you can re-run it later. Point the install somewhere else with
-`INSTALL_DIR=/opt/hermes-agent`, and pin the version with `HERMES_AGENT_REF=v1.2.3`.
+That also means `docker compose` is not available afterwards — there is no compose file left to
+point it at. Reinstall or uninstall by running the installer again. The compose project name is
+pinned to `hermes-agent` in the file itself, so running from a throwaway directory does not name
+the project after it.
+
+> **Write the dashboard password down when setup prints it.** It lives in `.env`, which goes with
+> the working directory. There is nowhere to look it up afterwards.
+
+Pin the version with `HERMES_AGENT_REF=v1.2.3`, or keep the working directory for debugging with
+`KEEP_DIR=1`.
 
 > Piping a script from the internet into a shell runs it before you have read it. To look first:
 > `curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh`
@@ -72,22 +81,22 @@ not echoed). Press Enter to skip and get a random string instead.
 
 ### Adding or removing 9router later
 
-The two extra services sit behind a compose **profile**, selected by `COMPOSE_PROFILES` in `.env`:
+The two extra services sit behind a compose **profile**. Setup writes `COMPOSE_PROFILES` into the
+`.env` it hands to compose, so the choice is made at install time:
 
 ```bash
-./setup.sh --with-router     # writes COMPOSE_PROFILES=router, generates its secrets
-docker compose up -d
+# add them
+curl -fsSL .../install.sh | bash -s -- --with-router
 
-# and to drop them again
-docker compose --profile router down   # stop what is running first
-sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/' .env
+# drop them again
+curl -fsSL .../install.sh | bash -s -- --uninstall --yes
+curl -fsSL .../install.sh | bash -s -- --without-router
 ```
 
-`COMPOSE_PROFILES` is read by the compose CLI itself, so a plain `docker compose up -d` in that
-directory always acts on the right set of services — no `--profile` to remember. A hermes-only
-install never creates `9router.env`, which is why the compose file marks that `env_file` as
-`required: false`: without it, even `docker compose ps` would fail over a file belonging to a
-service that is deliberately not running.
+`COMPOSE_PROFILES` is written into `.env` during the install and read by the compose CLI itself, so
+setup never has to remember `--profile`. A hermes-only install never creates `9router.env`, which is
+why the compose file marks that `env_file` as `required: false`: without it, even
+`docker compose ps` would fail over a file belonging to a service that is deliberately not running.
 
 The rest of this document describes the manual steps the script performs for you.
 
@@ -141,26 +150,33 @@ docker compose logs -f
 
 ## Uninstall
 
+There is no local script to run — it went with the working directory. Reach it the way you
+installed:
+
 ```bash
-cd ~/hermes-agent
-./uninstall.sh --dry-run   # print what would happen, change nothing
-./uninstall.sh             # containers + network only; your data stays
+curl -fsSL .../install.sh | bash -s -- --uninstall           # containers only; data stays
+curl -fsSL .../install.sh | bash -s -- --uninstall --purge   # + data + images
 ```
 
 | Flag | Also removes |
 |---|---|
-| *(none)* | Nothing but the containers and the project network |
+| *(none)* | The containers, and the `hermes` shell alias |
 | `--data` | `~/.hermes` and `~/.9router` — config, sessions, memories, **and the claude login** |
 | `--images` | The hermes, 9router and headroom images |
-| `--purge` | All of the above, plus the install directory itself |
+| `--purge` | Both of the above |
 | `--yes` | Skip the confirmation |
 
-The default leaves every byte of state on disk, so re-running `./setup.sh` brings the deployment
-back as it was. Anything that deletes data asks you to type `delete` in full — not `y`.
+The default leaves every byte of state on disk, so reinstalling picks up where it left off.
+Anything that deletes data asks you to type `delete` in full — not `y`.
 
-It always tears down with `--profile router`, whatever `COMPOSE_PROFILES` currently says: a
-deployment that switched the profile off leaves 9router and headroom running but invisible to a
-bare `docker compose down`, and uninstall is exactly the moment they must not be missed.
+The `hermes` alias goes with the containers it points at — leaving it behind would just fail with
+"No such container". Every candidate rc file is checked (`.zshrc`, `.bashrc`, `.profile`), not only
+the current shell's, since the install may have run under a different one. It is still live in the
+shell you are sitting in until you `unalias hermes` or open a new one.
+
+It always tears down with `--profile router`, whatever `COMPOSE_PROFILES` said: a deployment that
+switched the profile off leaves 9router and headroom running but invisible to a bare
+`docker compose down`, and uninstall is exactly the moment they must not be missed.
 
 ---
 
@@ -183,7 +199,8 @@ ssh -L 9119:127.0.0.1:9119 user@host
 
 ### Exposing it externally
 
-Set `HERMES_BIND_ADDR=0.0.0.0` in `.env`. Before you do, understand this:
+Reinstall with `HERMES_BIND_ADDR=0.0.0.0` set in the environment — there is no `.env` left on disk
+to edit. Before you do, understand this:
 
 A public dashboard with **no auth** was the entry point for the June 2026 MCP-config persistence
 campaign — internet scanners found exposed dashboards and drove the agent into installing an SSH-key
@@ -199,14 +216,21 @@ on a non-loopback bind.
 
 ## Day-to-day operation
 
-```bash
-docker compose logs -f                    # live logs (gateway + dashboard)
-docker compose restart                    # restart the whole container
-docker compose ps                         # status
+With the `hermes` alias setup installs (`alias hermes="docker exec -it hermes hermes"`):
 
-docker exec hermes hermes logs --follow   # structured Hermes logs
-docker exec hermes hermes status          # reports "Manager: s6 (container supervisor)"
-docker exec -it hermes hermes             # open the chat CLI inside the running container
+```bash
+hermes                  # open the chat CLI
+hermes status           # reports "Manager: s6 (container supervisor)"
+hermes logs --follow    # structured Hermes logs
+```
+
+`docker compose` is not available after an install — there is no compose file left on disk. Use
+docker directly:
+
+```bash
+docker logs -f hermes   # container stdout (gateway + dashboard)
+docker restart hermes
+docker ps
 ```
 
 `docker exec hermes ...` automatically drops from root to the `hermes` user (UID 10000), so files it
@@ -216,7 +240,7 @@ creates get the right ownership — no `--user` needed.
 
 | Source | Location |
 |---|---|
-| Gateway + dashboard, live | `docker compose logs -f` (rotated 20MB × 5, lost on `docker rm`) |
+| Gateway + dashboard, live | `docker logs -f hermes` (rotated 20MB × 5, lost on `docker rm`) |
 | Gateway, durable per profile | `~/.hermes/logs/gateways/<profile>/current` (rotated 10 × 1MB) |
 | Container boot audit | `~/.hermes/logs/container-boot.log` |
 | `agent.log`, `errors.log` | `~/.hermes/logs/` |
@@ -237,7 +261,7 @@ docker exec hermes hermes -p coder gateway status
 docker exec hermes hermes profile delete coder
 ```
 
-A running gateway **comes back on its own** after `docker compose restart` or an image upgrade. Only
+A running gateway **comes back on its own** after `docker restart hermes` or an image upgrade. Only
 an explicit `hermes gateway stop` keeps it down across restarts.
 
 **The dashboard needs a single port for all profiles** — the profile switcher in the UI sends the
@@ -264,9 +288,10 @@ Then publish `- "127.0.0.1:8643:8643"` in `docker-compose.yml`.
 
 ## Upgrading
 
+Re-run the installer; it pulls, rebuilds and recreates the containers:
+
 ```bash
-docker compose pull
-docker compose up -d
+curl -fsSL .../install.sh | bash -s -- --with-claude-code
 ```
 
 The data directory is left alone. The container runs config-schema migrations itself and writes
@@ -282,11 +307,14 @@ In production, pin `HERMES_IMAGE_TAG` to a specific version instead of `latest`.
 All state lives in bind-mounted directories; there are no named volumes:
 
 ```bash
-docker compose stop
-tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes           # hermes only
-tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes .9router  # with 9router
-docker compose start
+docker stop hermes
+sudo tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes           # hermes only
+sudo tar czf hermes-backup-$(date +%F).tar.gz -C ~ .hermes .9router  # with 9router
+docker start hermes
 ```
+
+`sudo` because the runtime chowns `~/.hermes` to UID 10000 mode 0700 — your own user cannot read
+it. The `claude` login and its session transcripts are inside, so this covers them too.
 
 The `claude` CLI's login and session transcripts are inside `.hermes` (the container's
 `/opt/data`), so they come back with it.
@@ -330,7 +358,7 @@ Check it: `docker exec hermes curl -s http://vllm:8000/v1/models`
 
 ### claude-proxy — running the `claude` CLI inside the hermes container
 
-Built from `./Dockerfile` (`./setup.sh --with-claude-code`), which adds three things to the published
+Built from `./Dockerfile` (installer flag `--with-claude-code`), which adds three things to the published
 hermes image: the `claude` CLI, `claude_proxy/server.py` fetched from
 [`0xphuong/claude-cli-adapter`](https://github.com/0xphuong/claude-cli-adapter), and an s6 service
 that supervises it. The proxy wraps the local CLI in an **Anthropic Messages API** — `POST
@@ -339,39 +367,64 @@ that supervises it. The proxy wraps the local CLI in an **Anthropic Messages API
 It listens on `127.0.0.1:8082` **inside the hermes container**, so hermes reaches it with no network
 hop and nothing published to the host.
 
-`./setup.sh --with-claude-code` writes this wiring into `~/.hermes/config.yaml` for you:
+Set this in `~/.hermes/config.yaml` by hand — setup prints the block at the end of an install.
+
+**The short form.** Override the built-in `anthropic` provider and point it at the proxy:
+
+```yaml
+model:
+  default: claude-opus-4-6
+  provider: anthropic
+providers:
+  anthropic:
+    api_key: dummy                       # required by the SDK, ignored by the proxy
+    base_url: http://127.0.0.1:8082/v1
+    default_model: claude-sonnet-4-6
+```
+
+The base_url has to live under `providers.anthropic`, not `model.base_url` — hermes ignores the
+latter for the `anthropic` provider and calls api.anthropic.com regardless, which looks exactly like
+the proxy being bypassed.
+
+**The long form**, if you would rather leave the `anthropic` provider untouched and declare a
+separate one:
 
 ```yaml
 model:
   default: claude-sonnet-4-6
-  provider: local
-  base_url: http://localhost:8082/v1
-  api_key: ${HERMES_CLAUDE_PROXY_API_KEY}   # required by the client, ignored by the proxy
-  api_mode: anthropic_messages              # NOT chat_completions
+  provider: local                        # must name an entry in custom_providers
+  base_url: http://127.0.0.1:8082/v1
+  api_key: dummy
+  api_mode: anthropic_messages           # NOT chat_completions
 
 custom_providers:
-  - name: local                             # must match model.provider
-    base_url: http://localhost:8082/v1
-    key_env: HERMES_CLAUDE_PROXY_API_KEY
+  - name: local
+    base_url: http://127.0.0.1:8082/v1
     model: claude-sonnet-4-6
     api_mode: anthropic_messages
 ```
 
-Two things that are easy to get wrong:
+Whichever you pick, two things are easy to get wrong:
 
-- `api_mode` **must** be `anthropic_messages`. The proxy serves `/v1/messages` only, so
-  `chat_completions` 404s every single call.
-- `provider: local` names an entry in `custom_providers`; the two have to agree. `provider: anthropic`
-  will not work here — hermes ignores `model.base_url` for it and goes straight to api.anthropic.com.
+- `api_mode` **must** be `anthropic_messages` wherever it appears. The proxy serves `/v1/messages`
+  only, so `chat_completions` 404s every single call.
+- `provider:` and the block it names have to agree. `provider: local` with no `custom_providers`
+  entry called `local` fails at startup.
 
-Like the rest of `setup.sh`, this is idempotent and never overwrites a deliberate choice: if
-`model.base_url` already points somewhere other than the proxy, it is reported and left alone. It
-also backs up `config.yaml` before writing, and sets `HERMES_CLAUDE_PROXY_API_KEY=dummy` in
-`~/.hermes/.env` because hermes refuses to start a provider whose `key_env` resolves to nothing.
+`config.yaml` is inside the container, and `/opt/data` is mode 0700 owned by UID 10000 — your own
+user cannot even read it from the host. Edit it from inside:
 
-Override the model with `CLAUDE_PROXY_MODEL=... ./setup.sh --with-claude-code`. Verify a name before
-wiring it in — `claude --model <id>` accepts `sonnet`, `opus`, `claude-sonnet-4-6` and other aliases,
-but not every string that looks valid.
+```bash
+docker exec -it -u hermes hermes vi /opt/data/config.yaml
+docker restart hermes
+```
+
+Verify a model name before wiring it in — `claude --model <id>` accepts `sonnet`, `opus`,
+`claude-sonnet-4-6` and other aliases, but not every string that looks valid. Check one with:
+
+```bash
+docker exec -u hermes hermes claude -p "hi" --model claude-sonnet-4-6 --output-format json
+```
 
 The `claude` CLI it drives uses the subscription login stored at `/opt/data/.claude`. Log in once:
 
@@ -392,7 +445,7 @@ Service controls, all inside the container:
 ```bash
 docker exec hermes /command/s6-svstat /run/service/claude-proxy   # up/down + uptime
 docker exec hermes curl -s http://127.0.0.1:8082/health
-docker compose logs -f hermes | grep -i proxy                     # it logs to stdout
+docker logs -f hermes | grep -i proxy                              # it logs to stdout
 ```
 
 Set `CLAUDE_PROXY_ENABLED=0` to leave the slot supervised but down.
@@ -458,11 +511,11 @@ docker exec hermes env HOME=/opt/data/home xurl auth status
 | Symptom | Fix |
 |---|---|
 | Compose says `required variable ... is missing` | You skipped `cp .env.example .env`, or left the dashboard credentials blank |
-| Container exits immediately | `docker compose logs` — usually `setup` was never run, or a port is taken |
+| Container exits immediately | `docker logs hermes` — usually `setup` was never run, or a port is taken |
 | `Permission denied` on `~/.hermes` | The runtime is UID 10000. Set `HERMES_PUID`/`HERMES_PGID` to match the directory owner (`id -u`, `id -g`) |
 | Browser tools fail silently | Missing shared memory — compose sets `shm_size: 1gb`, check nothing overrides it |
 | Dashboard unreachable | It is bound to loopback by design — use an SSH tunnel |
-| Gateway stuck after a network incident | `docker compose restart` |
+| Gateway stuck after a network incident | `docker restart hermes` |
 
 Check the image version: `docker run --rm nousresearch/hermes-agent:latest version`
 

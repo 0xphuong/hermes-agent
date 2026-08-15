@@ -9,6 +9,7 @@
 #   ./setup.sh --with-claude-code  # build the image with the `claude` CLI + claude-proxy
 #   ./setup.sh --no-start          # only write the config files, do not start
 #   ./setup.sh --non-interactive   # prompt for nothing (implies hermes only)
+#   ./setup.sh --uninstall         # remove containers; add --data --images --purge
 #   ./setup.sh --help
 #
 set -euo pipefail
@@ -20,6 +21,10 @@ NO_START=0
 NON_INTERACTIVE=0
 # empty = ask (or default to no when there is nothing to ask on)
 WITH_ROUTER=""
+UNINSTALL=0
+UN_DATA=0
+UN_IMAGES=0
+ASSUME_YES=0
 
 # ---------------------------------------------------------------- output ----
 if [ -t 1 ]; then
@@ -51,6 +56,11 @@ while [ $# -gt 0 ]; do
     --without-router)   WITH_ROUTER=0 ;;
     --no-start)         NO_START=1 ;;
     --non-interactive)  NON_INTERACTIVE=1 ;;
+    --uninstall)        UNINSTALL=1 ;;
+    --data)             UN_DATA=1 ;;
+    --images)           UN_IMAGES=1 ;;
+    --purge)            UN_DATA=1; UN_IMAGES=1 ;;
+    --yes|-y)           ASSUME_YES=1 ;;
     -h|--help)          usage ;;
     *)                  die "invalid argument: $1  (see --help)" ;;
   esac
@@ -183,6 +193,130 @@ for f in docker-compose.yml .env.example 9router.env.example; do
   die "missing $f"
 done
 ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null), compose $(docker compose version --short)"
+
+# ------------------------------------------------------------- uninstall ----
+# Lives here rather than in its own script because the install directory is
+# deleted after a deploy: a standalone uninstall.sh would be deleted with it.
+# Reach it the same way you installed:
+#   curl -fsSL .../install.sh | bash -s -- --uninstall --purge
+if [ "$UNINSTALL" = 1 ]; then
+  HERMES_DATA_DIR="$(expand_tilde "$(get_kv HERMES_DATA_DIR .env)")"
+  ROUTER_DATA_DIR="$(expand_tilde "$(get_kv ROUTER_DATA_DIR .env)")"
+  : "${HERMES_DATA_DIR:=$HOME/.hermes}"
+  : "${ROUTER_DATA_DIR:=$HOME/.9router}"
+
+  size_of() { if [ -d "$1" ]; then du -sh "$1" 2>/dev/null | cut -f1; else echo "-"; fi; }
+
+  printf '\n%sThis will remove%s\n' "$C_BOLD" "$C_RESET"
+  printf '  containers   hermes, 9router, headroom\n'
+  if [ "$UN_DATA" = 1 ]; then
+    printf '  %sdata         %s (%s)%s\n' "$C_RED" "$HERMES_DATA_DIR" "$(size_of "$HERMES_DATA_DIR")" "$C_RESET"
+    printf '  %s             %s (%s)%s\n' "$C_RED" "$ROUTER_DATA_DIR" "$(size_of "$ROUTER_DATA_DIR")" "$C_RESET"
+    printf '               %sconfig, sessions, memories, and the claude login%s\n' "$C_DIM" "$C_RESET"
+  fi
+  if [ "$UN_IMAGES" = 1 ]; then
+    printf '  images       hermes-agent, hermes-claude, 9router, headroom\n'
+  fi
+  if [ "$UN_DATA" = 0 ] && [ "$UN_IMAGES" = 0 ]; then
+    printf '\n%sKept%s  %s and the images — reinstalling picks up where this left off.\n' \
+      "$C_BOLD" "$C_RESET" "$HERMES_DATA_DIR"
+  fi
+  printf '\n'
+
+  if [ "$ASSUME_YES" = 0 ]; then
+    if [ ! -r /dev/tty ]; then
+      die "no terminal to confirm on — re-run with --yes if you mean it"
+    fi
+    if [ "$UN_DATA" = 1 ]; then
+      # Deleting state deserves more than a reflex keystroke.
+      printf '  %sType "delete" to confirm:%s ' "$C_BOLD" "$C_RESET"
+      IFS= read -r reply < /dev/tty || reply=""
+      [ "$reply" = "delete" ] || die "aborted — nothing was changed"
+    else
+      printf '  Continue? [y/N] '
+      IFS= read -r reply < /dev/tty || reply=""
+      case "$reply" in [Yy]*) ;; *) die "aborted — nothing was changed" ;; esac
+    fi
+    printf '\n'
+  fi
+
+  info "Removing containers"
+  # --profile router regardless of what .env says: a deployment that switched
+  # the profile off leaves those two running but invisible to a bare `down`,
+  # and this is exactly the moment they must not be missed.
+  docker compose --profile router down --remove-orphans 2>/dev/null \
+    || for c in hermes 9router headroom; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  ok "containers removed"
+
+  if [ "$UN_IMAGES" = 1 ]; then
+    info "Removing images"
+    for img in hermes-claude nousresearch/hermes-agent decolua/9router \
+               ghcr.io/chopratejas/headroom; do
+      ids="$(docker images -q "$img" 2>/dev/null | sort -u || true)"
+      if [ -n "$ids" ]; then
+        # shellcheck disable=SC2086
+        docker rmi $ids >/dev/null 2>&1 || warn "could not remove $img (still in use?)"
+        ok "$img"
+      fi
+    done
+  fi
+
+  if [ "$UN_DATA" = 1 ]; then
+    info "Deleting data"
+    for d in "$HERMES_DATA_DIR" "$ROUTER_DATA_DIR"; do
+      [ -d "$d" ] || continue
+      # The runtime chowns its data to UID 10000 mode 0700, so these are very
+      # often not yours to delete.
+      if rm -rf "$d" 2>/dev/null; then
+        ok "deleted $d"
+      elif command -v sudo >/dev/null 2>&1; then
+        warn "$d is owned by the container's UID 10000 — escalating"
+        sudo rm -rf "$d" && ok "deleted $d (via sudo)"
+      else
+        warn "could not delete $d — remove it by hand"
+      fi
+    done
+  fi
+
+  # The alias points at a container that no longer exists, so it goes too.
+  # Every candidate rc file is checked, not just the current shell's: the
+  # install may well have run under a different one.
+  remove_hermes_alias() {
+    local line='alias hermes="docker exec -it hermes hermes"'
+    local rc tmp found=0
+    for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+      [ -f "$rc" ] || continue
+      grep -qF "$line" "$rc" || continue
+      tmp="$(mktemp)"
+      # Drops the alias and the "# hermes-agent" marker that precedes it, and
+      # nothing else. The marker is held back one line so a stray comment that
+      # is NOT followed by our alias survives.
+      awk -v l="$line" '
+        $0 == "# hermes-agent" { if (held != "") print held; held = $0; next }
+        $0 == l                { held = ""; next }
+                               { if (held != "") { print held; held = "" } print }
+        END                    { if (held != "") print held }
+      ' "$rc" > "$tmp"
+      # cat rather than mv: keeps the rc file's own inode, owner and mode.
+      cat "$tmp" > "$rc"
+      rm -f "$tmp"
+      ok "removed the hermes alias from $rc"
+      found=1
+    done
+    if [ "$found" = 1 ]; then
+      printf '  %sGone from new shells. In this one: unalias hermes%s\n' "$C_DIM" "$C_RESET"
+    fi
+  }
+  remove_hermes_alias
+
+  printf '\n%sUninstalled.%s\n' "$C_BOLD" "$C_RESET"
+  if [ "$UN_DATA" = 0 ]; then
+    printf '  Your data is still at %s.\n' "$HERMES_DATA_DIR"
+    printf '  %sDelete it too by adding --data%s\n' "$C_DIM" "$C_RESET"
+  fi
+  printf '\n'
+  exit 0
+fi
 
 # ------------------------------------------------------------------ .env ----
 info "Preparing .env (hermes config)"
@@ -416,147 +550,6 @@ for _ in $(seq 1 30); do
   fi
 done
 
-# ------------------------------------------------- wire hermes -> proxy ----
-# Point hermes' model config at the in-container claude-proxy.
-#
-# Runs INSIDE the container, and only after the stack is up. Two reasons, both
-# learned the hard way:
-#
-#   * config.yaml does not exist until hermes has booted once. Patching before
-#     `up -d` found nothing, warned, and returned — then hermes started and
-#     wrote its own default (OpenRouter), so --with-claude-code built the image,
-#     started the proxy, and left hermes calling the internet.
-#   * the runtime chowns /opt/data to UID 10000 mode 0700. From the host,
-#     $HERMES_DATA_DIR is unreadable, so even `[ -f config.yaml ]` is false and
-#     every host-side edit fails with permission denied.
-#
-# Asking for --with-claude-code IS the request to route through the proxy, so
-# writing the block is the expected outcome. Confirm first when a terminal is
-# attached and the existing base_url points at something real; back up either
-# way.
-CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-sonnet-4-6}"
-CLAUDE_PROXY_KEY_ENV=HERMES_CLAUDE_PROXY_API_KEY
-
-# Read a value out of the container's config.yaml. Empty when absent.
-proxy_cfg_get() {
-  docker exec -u hermes hermes awk "$1" /opt/data/config.yaml 2>/dev/null || true
-}
-
-wire_claude_proxy() {
-  local cur reply
-
-  if ! docker exec -u hermes hermes test -f /opt/data/config.yaml 2>/dev/null; then
-    warn "hermes has not written config.yaml yet — re-run setup.sh once it has"
-    return 0
-  fi
-
-  # shellcheck disable=SC2016  # awk program: $1/$2 are awk fields, not shell
-  cur="$(proxy_cfg_get '
-    /^model:/            { inblk = 1; next }
-    inblk && /^[^ \t#]/  { inblk = 0 }
-    inblk && $1 == "base_url:" { print $2; exit }
-  ')"
-
-  case "$cur" in
-    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*) ;;
-    *)
-      if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
-        printf '\n  %sHermes currently calls%s %s\n' "$C_BOLD" "$C_RESET" "$cur"
-        printf '    Repoint it at claude-proxy (http://localhost:%s/v1)? [Y/n] ' \
-          "$ADAPTER_PROXY_PORT"
-        IFS= read -r reply < /dev/tty || reply=""
-        case "$reply" in
-          [Nn]*)
-            warn "left config.yaml alone — hermes still calls $cur"
-            warn "  the proxy is running either way; point model.base_url at it when you want it"
-            return 0
-            ;;
-        esac
-        printf '\n'
-      else
-        ok "replacing model.base_url $cur (you asked for --with-claude-code)"
-      fi
-      ;;
-  esac
-
-  # The patch itself, run as the hermes user so the files keep their ownership.
-  # Values arrive through the environment: interpolating them into the script
-  # would collide with awk's own $1/$0.
-  if docker exec -i -u hermes \
-       -e M="$CLAUDE_PROXY_MODEL" \
-       -e P="$ADAPTER_PROXY_PORT" \
-       -e K="$CLAUDE_PROXY_KEY_ENV" \
-       hermes sh -s <<'INNER'
-set -e
-cfg=/opt/data/config.yaml
-cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M%S)"
-
-# `provider: local` names an entry in custom_providers, so the pair is written
-# together. api_mode MUST be anthropic_messages: the proxy serves /v1/messages
-# only, and chat_completions 404s every call.
-blk=$(mktemp); ent=$(mktemp)
-{
-  echo "model:"
-  echo "  default: $M"
-  echo "  provider: local"
-  echo "  base_url: http://localhost:$P/v1"
-  echo "  api_key: \${$K}"
-  echo "  api_mode: anthropic_messages"
-} > "$blk"
-{
-  echo "  - name: local"
-  echo "    base_url: http://localhost:$P/v1"
-  echo "    key_env: $K"
-  echo "    model: $M"
-  echo "    api_mode: anthropic_messages"
-} > "$ent"
-
-# Replace the whole model block, leaving every other byte — and its comments —
-# untouched. Appends when the file has no such block. The text goes through a
-# file because `awk -v` cannot hold a newline.
-tmp=$(mktemp)
-awk -v blkfile="$blk" '
-  BEGIN             { while ((getline l < blkfile) > 0) b = b l "\n"; sub(/\n$/, "", b) }
-  /^model:/         { print b; inblk = 1; seen = 1; next }
-  inblk && /^[ \t]/ { next }
-  inblk             { inblk = 0 }
-                    { print }
-  END               { if (!seen) print b }
-' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
-
-if ! grep -qE '^[[:space:]]+- name: local[[:space:]]*$' "$cfg"; then
-  awk -v entfile="$ent" '
-    BEGIN                { while ((getline l < entfile) > 0) e = e l "\n"; sub(/\n$/, "", e) }
-    /^custom_providers:/ { print; print e; seen = 1; next }
-                         { print }
-    END                  { if (!seen) { print "custom_providers:"; print e } }
-  ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
-fi
-
-# The proxy ignores the key, but hermes refuses to start a provider whose
-# key_env resolves to nothing.
-env=/opt/data/.env
-[ -f "$env" ] || : > "$env"
-grep -q "^$K=" "$env" || echo "$K=dummy" >> "$env"
-
-grep -q '^model:' "$cfg"
-rm -f "$blk" "$ent" "$tmp"
-INNER
-  then
-    ok "model -> http://localhost:$ADAPTER_PROXY_PORT/v1 ($CLAUDE_PROXY_MODEL)"
-    ok "restarting hermes so it picks the new config up"
-    docker compose restart hermes >/dev/null 2>&1 || warn "could not restart hermes — do it by hand"
-  else
-    warn "could not patch config.yaml inside the container"
-  fi
-}
-
-if [ "$WITH_CLAUDE_CODE" = 1 ] && [ "$NO_START" = 0 ]; then
-  ADAPTER_PROXY_PORT="$(get_kv CLAUDE_PROXY_PORT .env)"; : "${ADAPTER_PROXY_PORT:=8082}"
-  info "Wiring hermes to claude-proxy"
-  wire_claude_proxy
-fi
-
 # --------------------------------------------------------------- summary ----
 BIND_ADDR="$(get_kv HERMES_BIND_ADDR .env)";        : "${BIND_ADDR:=127.0.0.1}"
 DASH_PORT="$(get_kv HERMES_DASHBOARD_PORT .env)";   : "${DASH_PORT:=9119}"
@@ -599,9 +592,13 @@ if [ "$WITH_ROUTER" = 1 ]; then
   else
     printf '  9router    password: %s\n' "$ROUTER_PASS"
   fi
-  printf '  %sForgot them? grep PASSWORD .env 9router.env%s\n\n' "$C_DIM" "$C_RESET"
+  printf '\n  %sSave these now.%s The working directory — .env and 9router.env with it —\n' \
+    "$C_RED" "$C_RESET"
+  printf '  is deleted when this finishes. There is nowhere left to look them up.\n\n'
 else
-  printf '  %sForgot it? grep PASSWORD .env%s\n\n' "$C_DIM" "$C_RESET"
+  printf '\n  %sSave this now.%s The working directory, .env included, is deleted when\n' \
+    "$C_RED" "$C_RESET"
+  printf '  this finishes. There is nowhere left to look it up.\n\n'
 fi
 
 if [ "$BIND_ADDR" = "127.0.0.1" ]; then
@@ -613,7 +610,7 @@ if [ "$BIND_ADDR" = "127.0.0.1" ]; then
   else
     printf '    ssh -L %s:127.0.0.1:%s user@<host>\n' "$DASH_PORT" "$DASH_PORT"
   fi
-  printf '  %sSet HERMES_BIND_ADDR=0.0.0.0 in .env to expose it — read the README first.%s\n\n' \
+  printf '  %sTo expose it, reinstall with HERMES_BIND_ADDR=0.0.0.0 set — read the README first.%s\n\n' \
     "$C_DIM" "$C_RESET"
 fi
 
@@ -625,11 +622,23 @@ fi
 printf '\n'
 
 if [ "$WITH_CLAUDE_CODE" = 1 ]; then
-  printf '%sModel wiring%s\n' "$C_BOLD" "$C_RESET"
-  printf '  %s/config.yaml already points at claude-proxy.\n' "$HERMES_DATA_DIR"
-  printf '  Log the claude CLI in once, then it is ready:\n'
+  printf '%sPoint hermes at claude-proxy%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Log the claude CLI in once:\n'
   printf '    docker exec -it -u hermes hermes claude\n'
-  printf '  Check:  docker exec -u hermes hermes hermes chat -q "say PONG"\n\n'
+  printf '  Then put this in %s/config.yaml:\n\n' "$HERMES_DATA_DIR"
+  printf '    model:\n'
+  printf '      default: claude-opus-4-6\n'
+  printf '      provider: anthropic\n'
+  printf '    providers:\n'
+  printf '      anthropic:\n'
+  printf '        api_key: dummy\n'
+  printf '        base_url: http://127.0.0.1:8082/v1\n'
+  printf '        default_model: claude-sonnet-4-6\n\n'
+  printf '  %sbase_url must sit under providers.anthropic — model.base_url is ignored\n' "$C_DIM"
+  printf '  for that provider and hermes calls api.anthropic.com instead.%s\n' "$C_RESET"
+  printf '  Edit from inside (the host cannot read /opt/data):\n'
+  printf '    docker exec -it -u hermes hermes vi /opt/data/config.yaml\n'
+  printf '    docker restart hermes\n\n'
 elif [ "$WITH_ROUTER" = 1 ]; then
   printf '%sWiring hermes to 9router%s\n' "$C_BOLD" "$C_RESET"
   printf '  Edit %s/config.yaml:\n' "$HERMES_DATA_DIR"
@@ -642,17 +651,51 @@ elif [ "$WITH_ROUTER" = 1 ]; then
 else
   printf '%sNext: pick a model%s\n' "$C_BOLD" "$C_RESET"
   printf '  The wizard wrote your provider keys to %s/.env.\n' "$HERMES_DATA_DIR"
-  printf '  Add 9router later with:  ./setup.sh --with-router\n\n'
+  printf '  Add 9router later by reinstalling with --with-router.\n\n'
 fi
 
-printf '%sCommon commands%s\n' "$C_BOLD" "$C_RESET"
-printf '  docker compose logs -f              # live logs\n'
-printf '  docker compose ps                   # status\n'
-printf '  docker compose restart hermes       # restart one service\n'
-printf '  docker compose down                 # stop the stack\n'
-printf '  docker exec -it hermes hermes       # open the chat CLI\n'
-printf '  docker exec hermes hermes status    # gateway status\n'
+# ----------------------------------------------------------------- alias ----
+# The install directory is deleted after this, so `docker compose` stops being
+# available. An alias straight onto the container is what is left, and it is
+# what people actually want to type anyway.
+install_hermes_alias() {
+  local rc line
+  line='alias hermes="docker exec -it hermes hermes"'
+
+  # Write to the rc file of the shell the user actually runs, falling back to
+  # bash. Appending to the wrong one looks like the alias silently failed.
+  case "$(basename "${SHELL:-/bin/bash}")" in
+    zsh)  rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bashrc" ;;
+    *)    rc="$HOME/.profile" ;;
+  esac
+
+  if [ -f "$rc" ] && grep -qF "$line" "$rc"; then
+    ok "alias already in $rc"
+    return 0
+  fi
+  printf '\n# hermes-agent\n%s\n' "$line" >> "$rc"
+  ok "added to $rc"
+  printf '  %sActive in new shells. For this one:%s source %s\n' "$C_DIM" "$C_RESET" "$rc"
+}
+
+if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
+  printf '%sShell alias%s\n' "$C_BOLD" "$C_RESET"
+  printf '  %shermes%s  ->  docker exec -it hermes hermes\n' "$C_BOLD" "$C_RESET"
+  printf '  Add it to your shell? [Y/n] '
+  IFS= read -r reply < /dev/tty || reply=""
+  case "$reply" in
+    [Nn]*) printf '  %sskipped — run: docker exec -it hermes hermes%s\n' "$C_DIM" "$C_RESET" ;;
+    *)     install_hermes_alias ;;
+  esac
+  printf '\n'
+fi
+
+printf '%sUsing it%s\n' "$C_BOLD" "$C_RESET"
+printf '  hermes                  # open the chat CLI\n'
+printf '  hermes status           # gateway status\n'
+printf '  hermes logs --follow    # live logs\n'
 if [ "$WITH_CLAUDE_CODE" = 1 ]; then
-  printf '  docker exec -it -u hermes hermes claude                 # log the claude CLI in\n'
+  printf '  docker exec -it -u hermes hermes claude   # log the claude CLI in (once)\n'
 fi
 printf '\n'

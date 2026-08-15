@@ -1,3 +1,9 @@
+# Pinned instead of inherited from the directory name. setup.sh runs from a
+# temporary clone that is deleted afterwards, so without this the project — and
+# with it the network name and every `docker compose` lookup — would be named
+# after a random tmp directory and change on every install.
+name: hermes-agent
+
 services:
   hermes:
     image: nousresearch/hermes-agent:${HERMES_IMAGE_TAG:-latest}
