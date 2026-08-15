@@ -32,6 +32,7 @@ INSTALL_FILES=(
   .dockerignore
   docker
   setup.sh
+  uninstall.sh
   .env.example
   9router.env.example
 )

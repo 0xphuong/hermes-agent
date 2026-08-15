@@ -139,6 +139,31 @@ docker compose logs -f
 
 ---
 
+## Uninstall
+
+```bash
+cd ~/hermes-agent
+./uninstall.sh --dry-run   # print what would happen, change nothing
+./uninstall.sh             # containers + network only; your data stays
+```
+
+| Flag | Also removes |
+|---|---|
+| *(none)* | Nothing but the containers and the project network |
+| `--data` | `~/.hermes` and `~/.9router` — config, sessions, memories, **and the claude login** |
+| `--images` | The hermes, 9router and headroom images |
+| `--purge` | All of the above, plus the install directory itself |
+| `--yes` | Skip the confirmation |
+
+The default leaves every byte of state on disk, so re-running `./setup.sh` brings the deployment
+back as it was. Anything that deletes data asks you to type `delete` in full — not `y`.
+
+It always tears down with `--profile router`, whatever `COMPOSE_PROFILES` currently says: a
+deployment that switched the profile off leaves 9router and headroom running but invisible to a
+bare `docker compose down`, and uninstall is exactly the moment they must not be missed.
+
+---
+
 ## Access
 
 | Service | Address | Notes |
