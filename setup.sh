@@ -405,14 +405,20 @@ fi
 # for the image that actually carries the proxy, and only after the wizard has
 # produced a config.yaml to patch.
 #
-# Idempotent like the rest of this script: it writes only when the model block
-# is missing or already aimed at the proxy. A model block pointing anywhere
-# else is a deliberate choice, so it is reported and left alone.
+# Asking for --with-claude-code IS the request to route hermes through the
+# proxy, so pointing the model block at it is the expected outcome, not an
+# intrusion. The wizard has just written its own provider (OpenRouter, say) a
+# few steps earlier; treating that as a choice to protect meant the flag
+# silently did half its job and hermes still called out to the internet.
+#
+# So: write it. Confirm first when there is a terminal and the existing block
+# points somewhere real, because replacing a working provider deserves a
+# glance — but default to yes, and take a backup either way.
 CLAUDE_PROXY_MODEL="${CLAUDE_PROXY_MODEL:-claude-sonnet-4-6}"
 CLAUDE_PROXY_KEY_ENV=HERMES_CLAUDE_PROXY_API_KEY
 
 wire_claude_proxy() {
-  local cfg="$HERMES_DATA_DIR/config.yaml" tmp cur block entry
+  local cfg="$HERMES_DATA_DIR/config.yaml" tmp cur block entry reply
   [ -f "$cfg" ] || { warn "no $cfg yet — run the wizard, then re-run setup.sh"; return 0; }
 
   # base_url of the current model block, empty when there is no block.
@@ -423,11 +429,26 @@ wire_claude_proxy() {
   ' "$cfg")"
 
   case "$cur" in
-    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*) ;;
+    ""|*localhost:"$ADAPTER_PROXY_PORT"*|*127.0.0.1:"$ADAPTER_PROXY_PORT"*)
+      # Nothing there, or already ours — just write it.
+      ;;
     *)
-      warn "model.base_url is already $cur — leaving config.yaml alone"
-      warn "  to use the proxy instead, set it to http://localhost:$ADAPTER_PROXY_PORT/v1"
-      return 0
+      if [ "$NON_INTERACTIVE" = 0 ] && [ -r /dev/tty ]; then
+        printf '\n  %sHermes currently calls%s %s\n' "$C_BOLD" "$C_RESET" "$cur"
+        printf '    Repoint it at claude-proxy (http://localhost:%s/v1)? [Y/n] ' \
+          "$ADAPTER_PROXY_PORT"
+        IFS= read -r reply < /dev/tty || reply=""
+        case "$reply" in
+          [Nn]*)
+            warn "left config.yaml alone — hermes still calls $cur"
+            warn "  the proxy is running either way; point model.base_url at it when you want it"
+            return 0
+            ;;
+        esac
+        printf '\n'
+      else
+        ok "replacing model.base_url $cur (you asked for --with-claude-code)"
+      fi
       ;;
   esac
 
