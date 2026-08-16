@@ -23,6 +23,11 @@
 #   curl -fsSL .../install.sh -o install.sh && less install.sh && bash install.sh
 set -euo pipefail
 
+SELF_URL="${HERMES_AGENT_INSTALLER_URL:-https://raw.githubusercontent.com/0xphuong/hermes-agent/main/install.sh}"
+# Kept for the docker-group re-exec below. %q so a re-exec cannot mangle an
+# argument containing a space.
+ORIG_ARGS="$(printf ' %q' "$@")"
+
 REPO="${HERMES_AGENT_REPO:-https://github.com/0xphuong/hermes-agent.git}"
 REF="${HERMES_AGENT_REF:-main}"
 KEEP_DIR="${KEEP_DIR:-0}"
@@ -163,8 +168,9 @@ ensure_docker() {
   add_user_to_docker_group
 }
 
-# Membership only takes effect in a new login session, so this cannot help the
-# run in progress — say so plainly instead of leaving a confusing failure.
+# Adds the user to the docker group and, because that cannot apply to a process
+# already running, re-executes the installer through `sg` so the run continues
+# instead of stopping halfway with homework.
 add_user_to_docker_group() {
   local me="${USER:-$(id -un)}"
   [ "$(id -u)" != 0 ] || return 0
@@ -177,6 +183,26 @@ add_user_to_docker_group() {
   fi
 
   docker info >/dev/null 2>&1 && return 0
+
+  # The group is in /etc/group now, but THIS process's credentials were fixed
+  # when the shell logged in, and nothing can add a group to a running process.
+  # `sg` starts a child that has it — enough to finish the install instead of
+  # dumping the user back at the prompt to log out, log in and start over.
+  #
+  # HERMES_AGENT_REEXEC stops that becoming a loop when docker is still
+  # unusable for some other reason (daemon down, socket permissions).
+  if [ "${HERMES_AGENT_REEXEC:-0}" != 1 ] && command -v sg >/dev/null 2>&1; then
+    info "Re-running under the docker group"
+    export HERMES_AGENT_REEXEC=1
+    printf '\n'
+    # Prefer re-running the file we came from; under `curl | bash` there is no
+    # file to re-run, so fetch it again.
+    if [ -f "$0" ] && [ -r "$0" ]; then
+      exec sg docker -c "bash $(printf '%q' "$0")$ORIG_ARGS"
+    else
+      exec sg docker -c "curl -fsSL $(printf '%q' "$SELF_URL") | bash -s --$ORIG_ARGS"
+    fi
+  fi
 
   printf '\n'
   warn "docker still is not usable as $me — group membership needs a new login session."
