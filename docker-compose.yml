@@ -15,6 +15,17 @@ services:
     # /opt/data. The image is stateless — upgrading loses nothing.
     volumes:
       - ${HERMES_DATA_DIR:-~/.hermes}:/opt/data
+      # Host timezone. Without this the container runs UTC and every log line,
+      # session timestamp and cron entry disagrees with the host clock.
+      #
+      # The mount alone is enough — deliberately no TZ variable. A zone name in
+      # TZ overrides the mount, so setting one would be a second source of
+      # truth free to drift from the first.
+      #
+      # /etc/localtime only, NOT /etc/timezone: that file is absent on Kali and
+      # the RHEL family, and a bind mount whose source is missing makes Docker
+      # create an empty DIRECTORY at that path on the host.
+      - /etc/localtime:/etc/localtime:ro
 
     networks:
       - hermes-net
@@ -150,6 +161,7 @@ services:
 
     volumes:
       - ${ROUTER_DATA_DIR:-~/.9router}:/app/data
+      - /etc/localtime:/etc/localtime:ro
 
     # A dedicated file, NOT the shared .env — that one holds hermes credentials
     # (dashboard password, CLAUDE_CODE_OAUTH_TOKEN) and env_file would load every
@@ -195,6 +207,9 @@ services:
     # Uncomment to reach it directly from the host for debugging.
     # ports:
     #   - "${HERMES_BIND_ADDR:-127.0.0.1}:8787:8787"
+
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
 
     networks:
       - hermes-net

@@ -540,6 +540,7 @@ docker exec hermes env HOME=/opt/data/home xurl auth status
 | Browser tools fail silently | Missing shared memory — compose sets `shm_size: 1gb`, check nothing overrides it |
 | Dashboard unreachable | It is bound to loopback by design — use an SSH tunnel |
 | Gateway stuck after a network incident | `docker restart hermes` |
+| Timestamps hours off the host clock | Every service bind-mounts `/etc/localtime` read-only, so this should not happen; check the mount survived a hand-edited compose file |
 
 Check the image version: `docker run --rm nousresearch/hermes-agent:latest version`
 
